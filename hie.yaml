@@ -1,0 +1,8 @@
+cradle:
+  cabal:
+    - path: "./src"
+      component: "lib:flor-do-mar"
+    - path: "./app/client"
+      component: "exe:flor-do-mar-client"
+    - path: "./test"
+      component: "test:combat-test"

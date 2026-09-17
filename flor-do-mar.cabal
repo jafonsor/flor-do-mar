@@ -1,0 +1,59 @@
+cabal-version: 3.8
+name:          flor-do-mar
+version:       0.1.0.0
+synopsis:      Tactical naval combat prototype
+description:   Initial Haskell Reflex skeleton for Flor do Mar.
+build-type:    Simple
+license:       BSD-3-Clause
+author:        Flor do Mar contributors
+maintainer:    Flor do Mar contributors
+
+common warnings
+  default-language: GHC2021
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wmissing-export-lists
+    -Wpartial-fields
+    -Wredundant-constraints
+
+library
+  import:           warnings
+  exposed-modules:
+    FlorDoMar.Combat
+    FlorDoMar.Combat.Api
+    FlorDoMar.Combat.Api.Local
+    FlorDoMar.Combat.Domain
+  hs-source-dirs:   src
+  build-depends:
+    base >=4.20 && <4.21,
+    text >=2.1 && <2.2
+
+executable flor-do-mar-client
+  import:          warnings
+  main-is:         Main.hs
+  other-modules:
+    FlorDoMar.Client.BattleScene
+    FlorDoMar.Client.BattleView
+  hs-source-dirs:  app/client
+  build-depends:
+    base >=4.20 && <4.21,
+    containers >=0.6 && <0.8,
+    flor-do-mar,
+    jsaddle >=0.9.9 && <0.10,
+    jsaddle-warp >=0.9.9 && <0.10,
+    reflex-dom-core >=0.8.1 && <0.9,
+    text >=2.1 && <2.2
+
+test-suite combat-test
+  import:          warnings
+  type:            exitcode-stdio-1.0
+  main-is:         CombatTest.hs
+  hs-source-dirs:  test
+  build-depends:
+    base >=4.20 && <4.21,
+    flor-do-mar,
+    text >=2.1 && <2.2
