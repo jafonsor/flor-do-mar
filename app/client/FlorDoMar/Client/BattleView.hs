@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module FlorDoMar.Client.BattleView
   ( battleView
@@ -7,16 +8,19 @@ module FlorDoMar.Client.BattleView
   )
 where
 
+import Control.Monad (void)
 import Data.Map qualified as Map
 import Data.Text (Text)
 import FlorDoMar.Client.BattleScene
 import FlorDoMar.Client.WebGL.Renderer qualified as WebGL
 import FlorDoMar.Combat
 import Language.Javascript.JSaddle
+import Language.Javascript.JSaddle.Value qualified as JS
 import Reflex.Dom.Core
 
 battleView ::
   ( DomBuilder t m
+  , ToJSVal (RawElement (DomBuilderSpace m))
   , MonadJSM (Performable m)
   , MonadHold t m
   , PerformEvent t m
@@ -25,14 +29,15 @@ battleView ::
   Dynamic t CombatSnapshot ->
   m ()
 battleView snapshotDynamic = do
-  elAttr "canvas" canvasAttributes blank
+  (canvasElement, ()) <- elAttr' "canvas" canvasAttributes blank
   postBuild <- getPostBuild
   initializedRenderer <-
     performEvent $
       fmap
         ( \snapshot ->
             liftJSM $ do
-              rendererMaybe <- initializeBattleRenderer "battle-view"
+              canvas <- toJSVal (_element_raw canvasElement)
+              rendererMaybe <- initializeBattleRenderer canvas
               case rendererMaybe of
                 Nothing -> pure ()
                 Just renderer -> renderBattleScene renderer (battleSceneFromSnapshot snapshot)
@@ -53,12 +58,21 @@ battleView snapshotDynamic = do
       (current rendererDynamic)
       (updated snapshotDynamic)
 
-initializeBattleRenderer :: Text -> JSM (Maybe WebGL.Renderer)
-initializeBattleRenderer canvasId = do
-  document <- jsg ("document" :: Text)
-  canvas <- callMethod "getElementById" document [canvasId]
-  gl <- callMethod "getContext" canvas ["webgl" :: Text]
-  WebGL.initRenderer gl
+initializeBattleRenderer :: JSVal -> JSM (Maybe WebGL.Renderer)
+initializeBattleRenderer canvas = do
+  canvasMaybe <- JS.maybeNullOrUndefined canvas
+  case canvasMaybe of
+    Nothing -> do
+      logBrowserError "Could not initialize battle renderer: canvas element is missing."
+      pure Nothing
+    Just canvasValue -> do
+      gl <- callMethod "getContext" canvasValue ["webgl" :: Text]
+      glMaybe <- JS.maybeNullOrUndefined gl
+      case glMaybe of
+        Nothing -> do
+          logBrowserError "Could not initialize battle renderer: WebGL context is unavailable."
+          pure Nothing
+        Just glValue -> WebGL.initRenderer glValue
 
 renderBattleScene :: WebGL.Renderer -> BattleScene -> JSM ()
 renderBattleScene renderer =
@@ -68,6 +82,11 @@ callMethod :: (MakeArgs args) => Text -> JSVal -> args -> JSM JSVal
 callMethod method target args = do
   functionValue <- target ! method
   call functionValue target args
+
+logBrowserError :: Text -> JSM ()
+logBrowserError message = do
+  console <- jsg ("console" :: Text)
+  void $ callMethod "error" console [message]
 
 canvasAttributes :: Map.Map Text Text
 canvasAttributes =

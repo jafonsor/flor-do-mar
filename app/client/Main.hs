@@ -9,11 +9,29 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import FlorDoMar.Client.BattleView (battleView)
 import FlorDoMar.Combat
-import Language.Javascript.JSaddle.Warp (run)
+import Language.Javascript.JSaddle.Warp (jsaddleApp, jsaddleOr)
+import Network.Wai.Handler.Warp qualified as Warp
+import Network.WebSockets (defaultConnectionOptions)
 import Reflex.Dom.Core
+import System.IO (hFlush, stdout)
 
 main :: IO ()
-main = run 3911 $ mainWidget app
+main = do
+  application <- jsaddleOr defaultConnectionOptions (mainWidget app) jsaddleApp
+  Warp.runSettings serverSettings application
+
+serverPort :: Int
+serverPort = 3911
+
+serverSettings :: Warp.Settings
+serverSettings =
+  Warp.setBeforeMainLoop logServerReady $
+    Warp.setPort serverPort Warp.defaultSettings
+
+logServerReady :: IO ()
+logServerReady = do
+  putStrLn $ "Flor do Mar client ready at http://localhost:" <> show serverPort <> "/"
+  hFlush stdout
 
 app :: Widget x ()
 app = do
