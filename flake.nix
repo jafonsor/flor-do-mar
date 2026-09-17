@@ -53,6 +53,7 @@
           ghc = haskellPackages.ghcWithPackages (
             hpkgs: with hpkgs; [
               jsaddle-warp
+              linear
               reflex-dom-core
               text
             ]

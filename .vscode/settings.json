@@ -1,0 +1,9 @@
+{
+    "editor.codeLens": true,
+    "editor.hover.enabled": "on",
+    "haskell.manageHLS": "PATH",
+    "haskell.serverExecutablePath": "${workspaceFolder}/.vscode/hls-nix-wrapper.sh",
+    "haskell.plugin.ghcide-hover-and-symbols.hoverOn": true,
+    "haskell.plugin.ghcide-type-lenses.globalOn": true,
+    "haskell.plugin.ghcide-type-lenses.config.mode": "always"
+}

@@ -38,6 +38,9 @@ executable flor-do-mar-client
   other-modules:
     FlorDoMar.Client.BattleScene
     FlorDoMar.Client.BattleView
+    FlorDoMar.Client.WebGL.Camera
+    FlorDoMar.Client.WebGL.Geometry
+    FlorDoMar.Client.WebGL.Math
   hs-source-dirs:  app/client
   build-depends:
     base >=4.20 && <4.21,
@@ -45,6 +48,7 @@ executable flor-do-mar-client
     flor-do-mar,
     jsaddle >=0.9.9 && <0.10,
     jsaddle-warp >=0.9.9 && <0.10,
+    linear >=1.23 && <1.24,
     reflex-dom-core >=0.8.1 && <0.9,
     text >=2.1 && <2.2
 
