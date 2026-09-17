@@ -45,6 +45,7 @@ The frontend should talk to combat through a server-like API. Early development 
 - **Scenario**: A predefined combat setup, including ships, positions, wind, and initial state.
 - **Command**: Player intent submitted to the Combat API, such as setting heading, changing sails, or firing a broadside.
 - **Snapshot**: A read model of combat state suitable for UI rendering.
+- **Tactical battle view**: The player-facing representation of combat used to read ship positions, headings, range, and battle state.
 - **Tick**: The fixed simulation step. Commands are applied on ticks.
 - **Caravela**: The first ship type used by the minimal playable scenario.
 - **Hull integrity**: The initial win/loss resource. A ship is disabled when hull integrity reaches zero.

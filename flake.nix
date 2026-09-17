@@ -58,6 +58,18 @@
               text
             ]
           );
+          playwrightNodeModules = pkgs.runCommand "playwright-node-modules" { } ''
+            mkdir -p "$out/node_modules"
+            ln -s ${pkgs.playwright-driver} "$out/node_modules/playwright"
+            ln -s ${pkgs.playwright-driver} "$out/node_modules/playwright-core"
+          '';
+          playwrightCli = pkgs.writeShellApplication {
+            name = "playwright";
+            runtimeInputs = [ pkgs.nodejs_22 ];
+            text = ''
+              exec ${pkgs.nodejs_22}/bin/node ${pkgs.playwright-driver}/cli.js "$@"
+            '';
+          };
         in
         {
           default = pkgs.mkShell {
@@ -66,8 +78,16 @@
               pkgs.cabal-install
               pkgs.ghcid
               haskellPackages.haskell-language-server
+              pkgs.nodejs_22
+              playwrightCli
+              pkgs.playwright-driver.browsers
               pkgs.nixfmt
             ];
+
+            NODE_PATH = "${playwrightNodeModules}/node_modules";
+            PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+            PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
+            PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
           };
         }
       );

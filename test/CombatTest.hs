@@ -3,6 +3,12 @@
 module Main (main) where
 
 import Control.Monad (replicateM_)
+import Data.Text (Text)
+import FlorDoMar.Client.BattleScene
+import FlorDoMar.Client.Render.Scene
+import FlorDoMar.Client.WebGL.Camera
+import FlorDoMar.Client.WebGL.Geometry
+import FlorDoMar.Client.WebGL.Math
 import FlorDoMar.Combat
 import System.Exit (die)
 
@@ -19,6 +25,8 @@ main = do
   testLocalApiStartsCaravelaDuel
   testLocalApiQueuesCommandsUntilTick
   testLocalApiReportsTerminalState
+  testInitialBattleRenderScene
+  testDamagedBattleRenderSceneTint
   putStrLn "combat-test: OK"
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -32,6 +40,30 @@ assertApprox label expected actual =
   if abs (expected - actual) < 0.0001
     then pure ()
     else die $ label <> ": expected " <> show expected <> ", got " <> show actual
+
+assertApproxScalar :: String -> Scalar -> Scalar -> IO ()
+assertApproxScalar label expected actual =
+  if abs (expected - actual) < 0.0001
+    then pure ()
+    else die $ label <> ": expected " <> show expected <> ", got " <> show actual
+
+assertVec2 :: String -> Vec2 -> Vec2 -> IO ()
+assertVec2 label expected actual = do
+  assertApproxScalar (label <> " x") (vec2X expected) (vec2X actual)
+  assertApproxScalar (label <> " y") (vec2Y expected) (vec2Y actual)
+
+assertVec3 :: String -> Vec3 -> Vec3 -> IO ()
+assertVec3 label expected actual = do
+  assertApproxScalar (label <> " x") (vec3X expected) (vec3X actual)
+  assertApproxScalar (label <> " y") (vec3Y expected) (vec3Y actual)
+  assertApproxScalar (label <> " z") (vec3Z expected) (vec3Z actual)
+
+assertColor :: String -> Color -> Color -> IO ()
+assertColor label expected actual = do
+  assertApproxScalar (label <> " red") (colorRed expected) (colorRed actual)
+  assertApproxScalar (label <> " green") (colorGreen expected) (colorGreen actual)
+  assertApproxScalar (label <> " blue") (colorBlue expected) (colorBlue actual)
+  assertApproxScalar (label <> " alpha") (colorAlpha expected) (colorAlpha actual)
 
 expectRight :: (Show e) => String -> Either e a -> IO a
 expectRight label result =
@@ -218,6 +250,94 @@ coolDownPlayerReload api =
   replicateM_ reloadTicks $ do
     _ <- advanceLocalApiTick "cool down player reload" api
     pure ()
+
+testInitialBattleRenderScene :: IO ()
+testInitialBattleRenderScene = do
+  let
+    renderScene =
+      battleRenderSceneFromSnapshot $
+        combatSnapshotFromState caravelaDuelScenario caravelaDuel
+    camera = renderSceneCamera renderScene
+    meshes = renderSceneMeshes renderScene
+  assertVec2 "render camera center" (vec2 0 40) (cameraCenter camera)
+  assertApproxScalar "render camera viewport width" 160 (viewportWidth (cameraViewport camera))
+  assertApproxScalar "render camera viewport height" 90 (viewportHeight (cameraViewport camera))
+  assertApproxScalar "render camera zoom" 1 (cameraZoom camera)
+  assertEqual "render mesh count" 4 (length meshes)
+  assertMesh
+    "initial player ship"
+    "ship:player"
+    (vec3 0 0 0)
+    0
+    (vec3 10 4 0.25)
+    (color 0.2 0.75 0.95 1)
+    =<< expectMesh "ship:player" renderScene
+  assertMesh
+    "initial player heading"
+    "heading:player"
+    (vec3 8 0 0)
+    0
+    (vec3 2 2 0.25)
+    (color 0.96 0.9 0.58 1)
+    =<< expectMesh "heading:player" renderScene
+  assertMesh
+    "initial enemy ship"
+    "ship:enemy"
+    (vec3 0 80 0)
+    pi
+    (vec3 10 4 0.25)
+    (color 0.95 0.34 0.24 1)
+    =<< expectMesh "ship:enemy" renderScene
+  assertMesh
+    "initial enemy heading"
+    "heading:enemy"
+    (vec3 (-8) 80 0)
+    pi
+    (vec3 2 2 0.25)
+    (color 0.96 0.9 0.58 1)
+    =<< expectMesh "heading:enemy" renderScene
+
+testDamagedBattleRenderSceneTint :: IO ()
+testDamagedBattleRenderSceneTint = do
+  let
+    damagedDuel =
+      caravelaDuel
+        { combatEnemy = (combatEnemy caravelaDuel) {shipHull = 50}
+        }
+    renderScene =
+      battleRenderSceneFromSnapshot $
+        combatSnapshotFromState caravelaDuelScenario damagedDuel
+  enemyShip <- expectMesh "ship:enemy" renderScene
+  assertColor
+    "damaged enemy ship tint"
+    (color 0.565 0.26 0.21 1)
+    (materialColor (renderMeshMaterial enemyShip))
+
+expectMesh :: Text -> RenderScene -> IO RenderMesh
+expectMesh name renderScene =
+  case filter ((== name) . renderMeshName) (renderSceneMeshes renderScene) of
+    [mesh] -> pure mesh
+    [] -> die $ "missing render mesh " <> show name
+    meshes -> die $ "expected one render mesh " <> show name <> ", got " <> show (length meshes)
+
+assertMesh ::
+  String ->
+  Text ->
+  Vec3 ->
+  Scalar ->
+  Vec3 ->
+  Color ->
+  RenderMesh ->
+  IO ()
+assertMesh label expectedName expectedPosition expectedRotation expectedScale expectedColor mesh = do
+  assertEqual (label <> " name") expectedName (renderMeshName mesh)
+  assertEqual (label <> " geometry") UnitCubeGeometry (renderMeshGeometry mesh)
+  assertVec3 (label <> " position") expectedPosition (transformPosition meshTransform)
+  assertApproxScalar (label <> " rotation") expectedRotation (transformRotationZ meshTransform)
+  assertVec3 (label <> " scale") expectedScale (transformScale meshTransform)
+  assertColor (label <> " color") expectedColor (materialColor (renderMeshMaterial mesh))
+ where
+  meshTransform = renderMeshTransform mesh
 
 assertEnemyHull :: String -> Int -> CombatSnapshot -> IO ()
 assertEnemyHull label expected snapshot = do

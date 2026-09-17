@@ -38,9 +38,11 @@ executable flor-do-mar-client
   other-modules:
     FlorDoMar.Client.BattleScene
     FlorDoMar.Client.BattleView
+    FlorDoMar.Client.Render.Scene
     FlorDoMar.Client.WebGL.Camera
     FlorDoMar.Client.WebGL.Geometry
     FlorDoMar.Client.WebGL.Math
+    FlorDoMar.Client.WebGL.Renderer
   hs-source-dirs:  app/client
   build-depends:
     base >=4.20 && <4.21,
@@ -56,8 +58,17 @@ test-suite combat-test
   import:          warnings
   type:            exitcode-stdio-1.0
   main-is:         CombatTest.hs
-  hs-source-dirs:  test
+  hs-source-dirs:
+    test
+    app/client
+  other-modules:
+    FlorDoMar.Client.BattleScene
+    FlorDoMar.Client.Render.Scene
+    FlorDoMar.Client.WebGL.Camera
+    FlorDoMar.Client.WebGL.Geometry
+    FlorDoMar.Client.WebGL.Math
   build-depends:
     base >=4.20 && <4.21,
     flor-do-mar,
+    linear >=1.23 && <1.24,
     text >=2.1 && <2.2
