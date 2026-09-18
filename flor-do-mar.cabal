@@ -7,6 +7,10 @@ build-type:    Simple
 license:       BSD-3-Clause
 author:        Flor do Mar contributors
 maintainer:    Flor do Mar contributors
+data-files:
+  config/combat/physics.toml
+  config/combat/boats/big.toml
+  config/combat/boats/small.toml
 
 common warnings
   default-language: GHC2021
@@ -22,14 +26,23 @@ common warnings
 
 library
   import:           warnings
+  autogen-modules:
+    Paths_flor_do_mar
   exposed-modules:
     FlorDoMar.Combat
     FlorDoMar.Combat.Api
     FlorDoMar.Combat.Api.Local
+    FlorDoMar.Combat.Config
     FlorDoMar.Combat.Domain
+    FlorDoMar.Combat.Setup
+  other-modules:
+    Paths_flor_do_mar
   hs-source-dirs:   src
   build-depends:
     base >=4.20 && <4.21,
+    containers >=0.6 && <0.8,
+    directory >=1.3 && <1.4,
+    filepath >=1.4 && <1.6,
     text >=2.1 && <2.2
 
 executable flor-do-mar-client

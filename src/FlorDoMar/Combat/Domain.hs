@@ -1,11 +1,14 @@
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module FlorDoMar.Combat.Domain
   ( BroadsideCheck (..)
   , BroadsideSide (..)
+  , BroadsideTuning (..)
   , CombatCommand (..)
   , CombatState (..)
   , Heading (..)
+  , MovementPhysics (..)
   , Point (..)
   , SailState (..)
   , ScenarioOutcome (..)
@@ -16,11 +19,17 @@ module FlorDoMar.Combat.Domain
   , broadsideDamage
   , broadsideRange
   , canFireBroadside
+  , canFireBroadsideWith
   , caravelaDuel
+  , legacyBroadsideTuning
   , reloadTicks
   , tickCombat
+  , tickCombatWith
+  , tickCombatWithTuning
   )
 where
+
+import Data.Text (Text)
 
 data ShipId
   = PlayerShip
@@ -55,12 +64,38 @@ data Wind = Wind
   }
   deriving stock (Eq, Show)
 
+data MovementPhysics = MovementPhysics
+  { movementBattleSpeed :: Double
+  , movementMaxSpeed :: Double
+  , movementAcceleration :: Double
+  , movementDeceleration :: Double
+  , movementTurnRate :: Double
+  , movementMinimumTurnSpeedFactor :: Double
+  }
+  deriving stock (Eq, Show)
+
+data BroadsideTuning = BroadsideTuning
+  { broadsideTuningRange :: Double
+  , broadsideTuningDamage :: Int
+  , broadsideTuningReloadTicks :: Int
+  , broadsideTuningFiringArcDegrees :: Double
+  }
+  deriving stock (Eq, Show)
+
 data Ship = Ship
   { shipId :: ShipId
+  , shipBoatKind :: Text
+  , shipDisplayName :: Text
   , shipPosition :: Point
   , shipHeading :: Heading
+  , shipTargetHeading :: Heading
   , shipSails :: SailState
+  , shipCurrentSpeed :: Double
+  , shipMaxHull :: Int
+  , shipDamageTaken :: Int
   , shipHull :: Int
+  , shipRenderedLength :: Double
+  , shipRenderedWidth :: Double
   , shipReload :: Int
   }
   deriving stock (Eq, Show)
@@ -113,7 +148,7 @@ caravelaDuel :: CombatState
 caravelaDuel =
   CombatState
     { combatTick = 0
-    , combatWind = Wind {windDirection = Heading 45, windSpeed = 12}
+    , combatWind = Wind {windDirection = Heading 0, windSpeed = 0}
     , combatPlayer =
         caravela
           PlayerShip
@@ -128,30 +163,41 @@ caravelaDuel =
     }
 
 tickCombat :: [CombatCommand] -> CombatState -> CombatState
-tickCombat commands state =
+tickCombat = tickCombatWith 1 (const caravelaMovement)
+
+tickCombatWith :: Double -> (Ship -> MovementPhysics) -> [CombatCommand] -> CombatState -> CombatState
+tickCombatWith tickSeconds movementForShip =
+  tickCombatWithTuning tickSeconds movementForShip (const legacyBroadsideTuning)
+
+tickCombatWithTuning :: Double -> (Ship -> MovementPhysics) -> (Ship -> BroadsideTuning) -> [CombatCommand] -> CombatState -> CombatState
+tickCombatWithTuning tickSeconds movementForShip broadsideTuningForShip commands state =
   case combatStatus state of
     ScenarioFinished _ -> state
     ScenarioRunning ->
       let
         commanded =
           foldl
-            applyCommand
+            (applyCommand broadsideTuningForShip)
             (coolDownReloads state {combatTick = combatTick state + 1})
             commands
         resolved = finishIfTerminal commanded
        in
         case combatStatus resolved of
           ScenarioFinished _ -> resolved
-          ScenarioRunning -> finishIfTerminal (moveShips resolved)
+          ScenarioRunning -> finishIfTerminal (moveShips tickSeconds movementForShip resolved)
 
 canFireBroadside :: CombatState -> ShipId -> ShipId -> BroadsideSide -> BroadsideCheck
-canFireBroadside state attackerId targetId side =
+canFireBroadside = canFireBroadsideWith (const legacyBroadsideTuning)
+
+canFireBroadsideWith :: (Ship -> BroadsideTuning) -> CombatState -> ShipId -> ShipId -> BroadsideSide -> BroadsideCheck
+canFireBroadsideWith broadsideTuningForShip state attackerId targetId side =
   case combatStatus state of
     ScenarioFinished outcome -> ScenarioAlreadyFinished outcome
     ScenarioRunning ->
       let
         attacker = selectShip attackerId state
         target = selectShip targetId state
+        tuning = broadsideTuningForShip attacker
         range = distance (shipPosition attacker) (shipPosition target)
         arcDelta = broadsideArcDelta attacker target side
        in
@@ -164,10 +210,10 @@ canFireBroadside state attackerId targetId side =
                 if shipReload attacker > 0
                   then BroadsideReloading (shipReload attacker)
                   else
-                    if range > broadsideRange
+                    if range > broadsideTuningRange tuning
                       then TargetOutOfRange range
                       else
-                        if arcDelta > broadsideArcDegrees
+                        if arcDelta > broadsideTuningFiringArcDegrees tuning
                           then TargetOutsideFiringArc arcDelta
                           else BroadsideReady
 
@@ -175,45 +221,122 @@ caravela :: ShipId -> Point -> Heading -> Ship
 caravela identity position heading =
   Ship
     { shipId = identity
+    , shipBoatKind = "caravela"
+    , shipDisplayName =
+        case identity of
+          PlayerShip -> "Player caravela"
+          EnemyShip -> "Enemy caravela"
     , shipPosition = position
     , shipHeading = normalizeHeading heading
+    , shipTargetHeading = normalizeHeading heading
     , shipSails = BattleSails
+    , shipCurrentSpeed = movementBattleSpeed caravelaMovement
+    , shipMaxHull = 100
+    , shipDamageTaken = 0
     , shipHull = 100
+    , shipRenderedLength = 10
+    , shipRenderedWidth = 4
     , shipReload = 0
     }
 
-applyCommand :: CombatState -> CombatCommand -> CombatState
-applyCommand state command =
+applyCommand :: (Ship -> BroadsideTuning) -> CombatState -> CombatCommand -> CombatState
+applyCommand broadsideTuningForShip state command =
   case command of
     SetHeading identity heading ->
-      updateShip identity (\ship -> ship {shipHeading = normalizeHeading heading}) state
+      updateShip identity (\ship -> ship {shipTargetHeading = normalizeHeading heading}) state
     SetSails identity sails ->
       updateShip identity (\ship -> ship {shipSails = sails}) state
     FireBroadside attackerId targetId side ->
-      case canFireBroadside state attackerId targetId side of
+      case canFireBroadsideWith broadsideTuningForShip state attackerId targetId side of
         BroadsideReady ->
-          updateShip attackerId (\ship -> ship {shipReload = reloadTicks}) $
-            updateShip targetId (\ship -> ship {shipHull = max 0 (shipHull ship - broadsideDamage)}) state
+          let tuning = broadsideTuningForShip (selectShip attackerId state)
+           in updateShip attackerId (\ship -> ship {shipReload = broadsideTuningReloadTicks tuning}) $
+                updateShip targetId (applyBroadsideDamage (broadsideTuningDamage tuning)) state
         _ -> state
+
+applyBroadsideDamage :: Int -> Ship -> Ship
+applyBroadsideDamage damage ship =
+  ship
+    { shipDamageTaken = damageTaken
+    , shipHull = max 0 (shipMaxHull ship - damageTaken)
+    }
+ where
+  -- Keep legacy states manually constructed with only shipHull intact.
+  damageTaken = max (shipDamageTaken ship) (shipMaxHull ship - shipHull ship) + damage
 
 coolDownReloads :: CombatState -> CombatState
 coolDownReloads =
   updateBothShips (\ship -> ship {shipReload = max 0 (shipReload ship - 1)})
 
-moveShips :: CombatState -> CombatState
-moveShips =
-  updateBothShips moveShip
+moveShips :: Double -> (Ship -> MovementPhysics) -> CombatState -> CombatState
+moveShips tickSeconds movementForShip =
+  updateBothShips (\ship -> moveShip tickSeconds (movementForShip ship) ship)
 
-moveShip :: Ship -> Ship
-moveShip ship =
-  ship {shipPosition = advancePoint (shipPosition ship) (shipHeading ship) (sailSpeed (shipSails ship))}
+moveShip :: Double -> MovementPhysics -> Ship -> Ship
+moveShip tickSeconds movement ship =
+  ship
+    { shipPosition = advancePoint (shipPosition ship) currentHeading (currentSpeed * tickSeconds)
+    , shipHeading = currentHeading
+    , shipCurrentSpeed = currentSpeed
+    }
+ where
+  currentHeading = turnToward (shipHeading ship) (shipTargetHeading ship) (effectiveTurnDegrees tickSeconds movement ship)
+  currentSpeed = approach (shipCurrentSpeed ship) (targetSpeed movement (shipSails ship)) speedDelta
+  speedDelta = tickSeconds * if targetSpeed movement (shipSails ship) >= shipCurrentSpeed ship then movementAcceleration movement else movementDeceleration movement
 
-sailSpeed :: SailState -> Double
-sailSpeed sails =
+caravelaMovement :: MovementPhysics
+caravelaMovement =
+  MovementPhysics
+    { movementBattleSpeed = 4
+    , movementMaxSpeed = 7
+    , movementAcceleration = 7
+    , movementDeceleration = 7
+    , movementTurnRate = 360
+    , movementMinimumTurnSpeedFactor = 1
+    }
+
+legacyBroadsideTuning :: BroadsideTuning
+legacyBroadsideTuning =
+  BroadsideTuning
+    { broadsideTuningRange = broadsideRange
+    , broadsideTuningDamage = broadsideDamage
+    , broadsideTuningReloadTicks = reloadTicks
+    , broadsideTuningFiringArcDegrees = broadsideArcDegrees
+    }
+
+sailSpeed :: MovementPhysics -> SailState -> Double
+sailSpeed movement sails =
   case sails of
     SailsFurled -> 0
-    BattleSails -> 4
-    FullSails -> 7
+    BattleSails -> movementBattleSpeed movement
+    FullSails -> movementMaxSpeed movement
+
+targetSpeed :: MovementPhysics -> SailState -> Double
+targetSpeed = sailSpeed
+
+effectiveTurnDegrees :: Double -> MovementPhysics -> Ship -> Double
+effectiveTurnDegrees tickSeconds movement ship =
+  movementTurnRate movement
+    * tickSeconds
+    * ( movementMinimumTurnSpeedFactor movement
+          + ((1 - movementMinimumTurnSpeedFactor movement) * min 1 (shipCurrentSpeed ship / movementMaxSpeed movement))
+      )
+
+turnToward :: Heading -> Heading -> Double -> Heading
+turnToward current target maximumTurn =
+  if abs delta <= headingArrivalEpsilon || abs delta <= maximumTurn
+    then normalizeHeading target
+    else normalizeHeading (Heading (headingDegrees current + signum delta * maximumTurn))
+ where
+  delta = normalizeSignedDegrees (headingDegrees target - headingDegrees current)
+
+headingArrivalEpsilon :: Double
+headingArrivalEpsilon = 0.001
+
+approach :: Double -> Double -> Double -> Double
+approach current target maximumChange
+  | current < target = min target (current + maximumChange)
+  | otherwise = max target (current - maximumChange)
 
 finishIfTerminal :: CombatState -> CombatState
 finishIfTerminal state =

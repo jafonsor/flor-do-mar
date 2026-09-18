@@ -28,7 +28,11 @@ data ShipMarker = ShipMarker
   { markerName :: Text
   , markerPosition :: Point
   , markerHeading :: Heading
+  , markerTargetHeading :: Heading
+  , markerMaxHull :: Int
   , markerHull :: Int
+  , markerRenderedLength :: Double
+  , markerRenderedWidth :: Double
   , markerIsPlayer :: Bool
   }
   deriving stock (Eq, Show)
@@ -58,10 +62,14 @@ battleRenderScene scene =
 shipMarker :: ShipSnapshot -> ShipMarker
 shipMarker ship =
   ShipMarker
-    { markerName = shipSnapshotName ship
+    { markerName = shipSnapshotDisplayName ship
     , markerPosition = shipSnapshotPosition ship
     , markerHeading = shipSnapshotHeading ship
+    , markerTargetHeading = shipSnapshotTargetHeading ship
+    , markerMaxHull = shipSnapshotMaxHull ship
     , markerHull = shipSnapshotHull ship
+    , markerRenderedLength = shipSnapshotRenderedLength ship
+    , markerRenderedWidth = shipSnapshotRenderedWidth ship
     , markerIsPlayer = shipSnapshotId ship == PlayerShip
     }
 
@@ -69,6 +77,7 @@ shipMeshes :: ShipMarker -> [RenderMesh]
 shipMeshes marker =
   [ shipBodyMesh marker
   , headingMarkerMesh marker
+  , targetHeadingMarkerMesh marker
   ]
 
 shipBodyMesh :: ShipMarker -> RenderMesh
@@ -81,7 +90,7 @@ shipBodyMesh marker =
         transform
           (pointPosition (markerPosition marker))
           (headingRadians (markerHeading marker))
-          shipScale
+          (shipScale marker)
     }
 
 headingMarkerMesh :: ShipMarker -> RenderMesh
@@ -95,6 +104,19 @@ headingMarkerMesh marker =
           (headingMarkerPosition marker)
           (headingRadians (markerHeading marker))
           headingMarkerScale
+    }
+
+targetHeadingMarkerMesh :: ShipMarker -> RenderMesh
+targetHeadingMarkerMesh marker =
+  RenderMesh
+    { renderMeshName = meshName "target-heading" marker
+    , renderMeshGeometry = UnitCubeGeometry
+    , renderMeshMaterial = basicMaterial targetHeadingColor
+    , renderMeshTransform =
+        transform
+          (targetHeadingMarkerPosition marker)
+          (headingRadians (markerTargetHeading marker))
+          targetHeadingMarkerScale
     }
 
 meshName :: Text -> ShipMarker -> Text
@@ -119,13 +141,24 @@ headingMarkerPosition marker =
       (realToFrac (pointY position) + headingMarkerDistance * sin radians)
       0
 
+targetHeadingMarkerPosition :: ShipMarker -> Vec3
+targetHeadingMarkerPosition marker =
+  let
+    position = markerPosition marker
+    radians = headingRadians (markerTargetHeading marker)
+   in
+    vec3
+      (realToFrac (pointX position) + targetHeadingMarkerDistance * cos radians)
+      (realToFrac (pointY position) + targetHeadingMarkerDistance * sin radians)
+      0
+
 headingRadians :: Heading -> Scalar
 headingRadians (Heading degrees) =
   realToFrac (degrees * pi / 180)
 
 damagedShipColor :: ShipMarker -> Color
 damagedShipColor marker =
-  tintColor darkGray (baseShipColor marker) (hullRatio (markerHull marker))
+  tintColor darkGray (baseShipColor marker) (hullRatio (markerMaxHull marker) (markerHull marker))
 
 baseShipColor :: ShipMarker -> Color
 baseShipColor marker =
@@ -133,9 +166,9 @@ baseShipColor marker =
     then playerColor
     else enemyColor
 
-hullRatio :: Int -> Scalar
-hullRatio hull =
-  clamp 0 1 (fromIntegral hull / 100)
+hullRatio :: Int -> Int -> Scalar
+hullRatio maxHull hull =
+  clamp 0 1 (fromIntegral hull / fromIntegral maxHull)
 
 tintColor :: Color -> Color -> Scalar -> Color
 tintColor from to amount =
@@ -153,14 +186,24 @@ clamp :: Scalar -> Scalar -> Scalar -> Scalar
 clamp lower upper value =
   max lower (min upper value)
 
-shipScale :: Vec3
-shipScale = vec3 10 4 0.25
+shipScale :: ShipMarker -> Vec3
+shipScale marker =
+  vec3
+    (realToFrac (markerRenderedLength marker))
+    (realToFrac (markerRenderedWidth marker))
+    0.25
 
 headingMarkerScale :: Vec3
 headingMarkerScale = vec3 2 2 0.25
 
+targetHeadingMarkerScale :: Vec3
+targetHeadingMarkerScale = vec3 1 1 0.25
+
 headingMarkerDistance :: Scalar
 headingMarkerDistance = 8
+
+targetHeadingMarkerDistance :: Scalar
+targetHeadingMarkerDistance = 11
 
 playerColor :: Color
 playerColor = color 0.2 0.75 0.95 1
@@ -170,6 +213,9 @@ enemyColor = color 0.95 0.34 0.24 1
 
 headingColor :: Color
 headingColor = color 0.96 0.9 0.58 1
+
+targetHeadingColor :: Color
+targetHeadingColor = color 0.56 0.93 0.7 1
 
 darkGray :: Color
 darkGray = color 0.18 0.18 0.18 1

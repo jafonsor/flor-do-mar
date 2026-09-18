@@ -13,6 +13,7 @@ module FlorDoMar.Combat.Api
   , caravelaDuelScenario
   , caravelaDuelScenarioId
   , combatSnapshotFromState
+  , combatSnapshotFromStateWith
   )
 where
 
@@ -40,6 +41,7 @@ data CombatApi m = CombatApi
 
 data CombatApiError
   = CombatScenarioNotFound ScenarioId
+  | CombatBoatKindNotFound Text
   | CombatScenarioNotStarted
   deriving stock (Eq, Show)
 
@@ -61,11 +63,18 @@ data WindSnapshot = WindSnapshot
 
 data ShipSnapshot = ShipSnapshot
   { shipSnapshotId :: ShipId
+  , shipSnapshotBoatKind :: Text
   , shipSnapshotName :: Text
+  , shipSnapshotDisplayName :: Text
   , shipSnapshotPosition :: Point
   , shipSnapshotHeading :: Heading
+  , shipSnapshotTargetHeading :: Heading
   , shipSnapshotSails :: SailState
+  , shipSnapshotCurrentSpeed :: Double
+  , shipSnapshotMaxHull :: Int
   , shipSnapshotHull :: Int
+  , shipSnapshotRenderedLength :: Double
+  , shipSnapshotRenderedWidth :: Double
   , shipSnapshotReload :: Int
   }
   deriving stock (Eq, Show)
@@ -88,7 +97,10 @@ caravelaDuelScenario =
     }
 
 combatSnapshotFromState :: ScenarioSummary -> CombatState -> CombatSnapshot
-combatSnapshotFromState scenario state =
+combatSnapshotFromState = combatSnapshotFromStateWith (const legacyBroadsideTuning)
+
+combatSnapshotFromStateWith :: (Ship -> BroadsideTuning) -> ScenarioSummary -> CombatState -> CombatSnapshot
+combatSnapshotFromStateWith broadsideTuningForShip scenario state =
   CombatSnapshot
     { combatSnapshotScenario = scenario
     , combatSnapshotTick = combatTick state
@@ -100,8 +112,8 @@ combatSnapshotFromState scenario state =
     , combatSnapshotEngagement =
         EngagementSnapshot
           { engagementRange = pointDistance (shipPosition (combatPlayer state)) (shipPosition (combatEnemy state))
-          , engagementPlayerPortBroadside = canFireBroadside state PlayerShip EnemyShip Port
-          , engagementPlayerStarboardBroadside = canFireBroadside state PlayerShip EnemyShip Starboard
+          , engagementPlayerPortBroadside = canFireBroadsideWith broadsideTuningForShip state PlayerShip EnemyShip Port
+          , engagementPlayerStarboardBroadside = canFireBroadsideWith broadsideTuningForShip state PlayerShip EnemyShip Starboard
           }
     , combatSnapshotStatus = combatStatus state
     }
@@ -117,19 +129,20 @@ shipSnapshot :: Ship -> ShipSnapshot
 shipSnapshot ship =
   ShipSnapshot
     { shipSnapshotId = shipId ship
-    , shipSnapshotName = shipName (shipId ship)
+    , shipSnapshotBoatKind = shipBoatKind ship
+    , shipSnapshotName = shipDisplayName ship
+    , shipSnapshotDisplayName = shipDisplayName ship
     , shipSnapshotPosition = shipPosition ship
     , shipSnapshotHeading = shipHeading ship
+    , shipSnapshotTargetHeading = shipTargetHeading ship
     , shipSnapshotSails = shipSails ship
+    , shipSnapshotCurrentSpeed = shipCurrentSpeed ship
+    , shipSnapshotMaxHull = shipMaxHull ship
     , shipSnapshotHull = shipHull ship
+    , shipSnapshotRenderedLength = shipRenderedLength ship
+    , shipSnapshotRenderedWidth = shipRenderedWidth ship
     , shipSnapshotReload = shipReload ship
     }
-
-shipName :: ShipId -> Text
-shipName identity =
-  case identity of
-    PlayerShip -> "Player caravela"
-    EnemyShip -> "Enemy caravela"
 
 pointDistance :: Point -> Point -> Double
 pointDistance from to =

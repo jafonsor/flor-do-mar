@@ -1,0 +1,15 @@
+id = "small"
+display_name = "Big boat"
+max_hull = 160
+rendered_length = 16
+rendered_width = 6
+battle_speed = 4
+max_speed = 7
+acceleration = 2
+deceleration = 3
+turn_rate = 30
+minimum_turn_speed_factor = 0.25
+broadside_range = 100
+broadside_damage = 25
+reload_ticks = 3
+firing_arc_degrees = 45
