@@ -43,7 +43,20 @@ The frontend should talk to combat through a server-like API. Early development 
 - **Local Combat API**: An in-process implementation of the Combat API used for local playtests and frontend development.
 - **Remote Combat API**: A future networked implementation of the same API for multiplayer.
 - **Scenario**: A predefined combat setup, including ships, positions, wind, and initial state.
-- **Command**: Player intent submitted to the Combat API, such as setting heading, changing sails, or firing a broadside.
+- **Command**: Player intent submitted to the Combat API, such as issuing a navigation order or firing a broadside.
+- **Navigation order**: A movement command that tells a ship which waypoint to reach and what speed to target after reaching it. Avoid: direct steering.
+- **Autopilot**: A non-player behavior that issues navigation orders using the same movement model available to player commands. Avoid: special enemy movement.
+- **Orbit**: An autopilot pattern that keeps issuing navigation orders around a fixed center point.
+- **Waypoint**: A point in battle space that a navigation order asks a ship to reach. Avoid: target point, destination.
+- **Arrival radius**: The area around a waypoint where a ship is considered to have reached it. Avoid: exact point arrival.
+- **Post-waypoint speed**: The speed a navigation order targets after the ship reaches its waypoint. It is continuous from stopped to the ship's maximum speed, and may be chosen explicitly or inherit the ship's arrival speed.
+- **Speed ring**: A tactical battle view marker anchored to the reachable waypoint that compares expected or selected post-waypoint speed with the ship's maximum speed. Avoid: max speed circle, speed circle.
+- **Projected trajectory**: The expected path a ship will follow from its current movement state under a navigation order. It should account for speed and maneuvering limits, and should match actual movement unless battle conditions change before or during execution.
+- **Kinematically constrained trajectory planner**: The movement planner that produces projected trajectories within a ship's speed, acceleration, deceleration, rudder authority, and turn-radius limits. Avoid: direct cursor path, candidate-only steering.
+- **Turn speed**: The fastest speed at which a ship can follow the required curve toward a waypoint. It is constrained by the ship's turn rate and maximum speed.
+- **Rudder authority**: How strongly a ship can change heading at a given speed. It may be absent when stopped, strongest around the ship's ideal turn speed, and limited by the ship's turning characteristics at high speed.
+- **Yaw inertia**: Resistance to changes in a ship's turn rate. A ship accelerates into and out of its maximum yaw rate instead of changing turn rate instantly, and may retain ship-specific handling factors even if mass is modeled later.
+- **Ideal turn speed**: The speed where a ship has full rudder authority. Above this speed the ship may still move faster, but its turning radius grows.
 - **Snapshot**: A read model of combat state suitable for UI rendering.
 - **Tactical battle view**: The player-facing representation of combat used to read ship positions, headings, range, and battle state.
 - **Tick**: The fixed simulation step. Commands are applied on ticks.
