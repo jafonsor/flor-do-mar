@@ -5,6 +5,7 @@ module FlorDoMar.Client.WebGL.Math
   , Vec2
   , Vec3
   , Vec4
+  , Quaternion (..)
   , Mat4
   , vec2
   , vec2X
@@ -20,14 +21,18 @@ module FlorDoMar.Client.WebGL.Math
   , mat4FromColumns
   , multiply4
   , orthographic
+  , quaternionRotation4
+  , rotationZQuaternion
   , rotationZ4
   , scaling4
   , translation4
+  , transformPoint3
   , mat4ToColumnMajorList
   )
 where
 
 import Linear.Matrix (M44)
+import Linear.Quaternion (Quaternion (..), axisAngle)
 import Linear.V2 (V2 (..))
 import Linear.V3 (V3 (..))
 import Linear.V4 (V4 (..))
@@ -120,14 +125,19 @@ translation4 position =
 
 rotationZ4 :: Scalar -> Mat4
 rotationZ4 radians =
+  quaternionRotation4 (rotationZQuaternion radians)
+
+rotationZQuaternion :: Scalar -> Quaternion Scalar
+rotationZQuaternion radians =
+  axisAngle (V3 0 0 1) radians
+
+quaternionRotation4 :: Quaternion Scalar -> Mat4
+quaternionRotation4 (Quaternion w (V3 x y z)) =
   mat4FromColumns
-    (vec4 cosine sine 0 0)
-    (vec4 (-sine) cosine 0 0)
-    (vec4 0 0 1 0)
+    (vec4 (1 - 2 * (y * y + z * z)) (2 * (x * y + z * w)) (2 * (x * z - y * w)) 0)
+    (vec4 (2 * (x * y - z * w)) (1 - 2 * (x * x + z * z)) (2 * (y * z + x * w)) 0)
+    (vec4 (2 * (x * z + y * w)) (2 * (y * z - x * w)) (1 - 2 * (x * x + y * y)) 0)
     (vec4 0 0 0 1)
- where
-  cosine = cos radians
-  sine = sin radians
 
 scaling4 :: Vec3 -> Mat4
 scaling4 scale =
@@ -140,6 +150,13 @@ scaling4 scale =
 mat4ToColumnMajorList :: Mat4 -> [Scalar]
 mat4ToColumnMajorList (Mat4 (V4 column0 column1 column2 column3)) =
   foldMap v4ToList [column0, column1, column2, column3]
+
+transformPoint3 :: Mat4 -> Vec3 -> Vec3
+transformPoint3 (Mat4 (V4 column0 column1 column2 column3)) (Vec3 (V3 x y z)) =
+  vec3
+    (componentX column0 x column1 y column2 z column3)
+    (componentY column0 x column1 y column2 z column3)
+    (componentZ column0 x column1 y column2 z column3)
 
 multiplyColumn :: M44 Scalar -> V4 Scalar -> V4 Scalar
 multiplyColumn (V4 left0 left1 left2 left3) (V4 x y z w) =
@@ -160,3 +177,15 @@ addV4 (V4 leftX leftY leftZ leftW) (V4 rightX rightY rightZ rightW) =
 
 v4ToList :: V4 Scalar -> [Scalar]
 v4ToList (V4 x y z w) = [x, y, z, w]
+
+componentX :: V4 Scalar -> Scalar -> V4 Scalar -> Scalar -> V4 Scalar -> Scalar -> V4 Scalar -> Scalar
+componentX (V4 x0 _ _ _) scale0 (V4 x1 _ _ _) scale1 (V4 x2 _ _ _) scaleZ (V4 x3 _ _ _) =
+  (x0 * scale0) + (x1 * scale1) + (x2 * scaleZ) + x3
+
+componentY :: V4 Scalar -> Scalar -> V4 Scalar -> Scalar -> V4 Scalar -> Scalar -> V4 Scalar -> Scalar
+componentY (V4 _ y0 _ _) scale0 (V4 _ y1 _ _) scale1 (V4 _ y2 _ _) scaleZ (V4 _ y3 _ _) =
+  (y0 * scale0) + (y1 * scale1) + (y2 * scaleZ) + y3
+
+componentZ :: V4 Scalar -> Scalar -> V4 Scalar -> Scalar -> V4 Scalar -> Scalar -> V4 Scalar -> Scalar
+componentZ (V4 _ _ z0 _) scale0 (V4 _ _ z1 _) scale1 (V4 _ _ z2 _) scaleZ (V4 _ _ z3 _) =
+  (z0 * scale0) + (z1 * scale1) + (z2 * scaleZ) + z3

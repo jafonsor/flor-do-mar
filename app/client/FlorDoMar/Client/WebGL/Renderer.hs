@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module FlorDoMar.Client.WebGL.Renderer
@@ -8,6 +9,10 @@ module FlorDoMar.Client.WebGL.Renderer
 where
 
 import Control.Monad (void)
+import Control.Monad.IO.Class (liftIO)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Word (Word16)
 import FlorDoMar.Client.Render.Scene
@@ -28,11 +33,17 @@ data Renderer = Renderer
   , rendererPositionAttribute :: Int
   , rendererMatrixUniform :: JSVal
   , rendererColorUniform :: JSVal
-  , rendererVertexBuffer :: JSVal
-  , rendererIndexBuffer :: JSVal
-  , rendererIndexCount :: Int
+  , rendererGeometryCache :: IORef (Map Text CachedGeometry)
   , rendererCanvasWidth :: Int
   , rendererCanvasHeight :: Int
+  }
+
+-- | A primitive's geometry as it currently exists on the GPU, kept so a redraw
+-- can skip re-uploading geometry that has not changed.
+data CachedGeometry = CachedGeometry
+  { cachedGeometrySource :: Geometry3D
+  , cachedVertexBuffer :: JSVal
+  , cachedIndexBuffer :: JSVal
   }
 
 initRenderer :: JSVal -> JSM (Maybe Renderer)
@@ -56,11 +67,8 @@ renderScene renderer scene = do
   void $ callMethod "clearDepth" gl [1 :: Double]
   void $ callMethod "clear" gl [colorBufferBit + depthBufferBit]
   void $ callMethod "useProgram" gl [rendererProgram renderer]
-  void $ callMethod "bindBuffer" gl (arrayBuffer, rendererVertexBuffer renderer)
-  void $ callMethod "bindBuffer" gl (elementArrayBuffer, rendererIndexBuffer renderer)
   void $ callMethod "enableVertexAttribArray" gl [rendererPositionAttribute renderer]
-  void $ callMethod "vertexAttribPointer" gl (rendererPositionAttribute renderer, 3 :: Int, glFloat, False, 0 :: Int, 0 :: Int)
-  mapM_ (drawMesh renderer (renderSceneCamera scene)) (renderSceneMeshes scene)
+  mapM_ (drawPrimitive renderer (renderSceneCamera scene)) (renderScenePrimitives scene)
 
 initializeRendererWithProgram :: JSVal -> JSVal -> JSM (Maybe Renderer)
 initializeRendererWithProgram gl program = do
@@ -70,17 +78,15 @@ initializeRendererWithProgram gl program = do
   colorUniform <- callMethod "getUniformLocation" gl (program, "u_color" :: Text)
   matrixUniformMaybe <- JS.maybeNullOrUndefined matrixUniform
   colorUniformMaybe <- JS.maybeNullOrUndefined colorUniform
-  vertexBufferMaybe <- createBuffer gl
-  indexBufferMaybe <- createBuffer gl
   canvas <- gl ! ("canvas" :: Text)
   canvasWidth <- round <$> (JS.valToNumber =<< canvas ! ("width" :: Text))
   canvasHeight <- round <$> (JS.valToNumber =<< canvas ! ("height" :: Text))
-  case (positionAttribute >= 0, matrixUniformMaybe, colorUniformMaybe, vertexBufferMaybe, indexBufferMaybe) of
-    (True, Just matrixUniformValue, Just colorUniformValue, Just vertexBuffer, Just indexBuffer) -> do
-      uploadCubeGeometry gl vertexBuffer indexBuffer
+  case (positionAttribute >= 0, matrixUniformMaybe, colorUniformMaybe) of
+    (True, Just matrixUniformValue, Just colorUniformValue) -> do
       void $ callMethod "useProgram" gl [program]
       void $ callMethod "enable" gl [depthTest]
       void $ callMethod "depthFunc" gl [lessEqual]
+      geometryCache <- liftIO $ newIORef Map.empty
       pure $
         Just
           Renderer
@@ -89,9 +95,7 @@ initializeRendererWithProgram gl program = do
             , rendererPositionAttribute = positionAttribute
             , rendererMatrixUniform = matrixUniformValue
             , rendererColorUniform = colorUniformValue
-            , rendererVertexBuffer = vertexBuffer
-            , rendererIndexBuffer = indexBuffer
-            , rendererIndexCount = length (geometry3DIndices unitCubeGeometry)
+            , rendererGeometryCache = geometryCache
             , rendererCanvasWidth = canvasWidth
             , rendererCanvasHeight = canvasHeight
             }
@@ -99,50 +103,97 @@ initializeRendererWithProgram gl program = do
       logWebGlError "Could not initialize WebGL renderer resources."
       pure Nothing
 
-drawMesh :: Renderer -> Camera2D -> RenderMesh -> JSM ()
-drawMesh renderer camera mesh =
-  case renderMeshGeometry mesh of
-    UnitCubeGeometry -> do
-      let
-        matrix =
-          camera2DMatrix camera
-            `multiply4` transformMatrix (renderMeshTransform mesh)
-        fill = materialColor (renderMeshMaterial mesh)
-      uploadMatrix (rendererGl renderer) (rendererMatrixUniform renderer) matrix
-      void $
-        callMethod
-          "uniform4f"
-          (rendererGl renderer)
-          ( rendererColorUniform renderer
-          , realToFrac (colorRed fill) :: Double
-          , realToFrac (colorGreen fill) :: Double
-          , realToFrac (colorBlue fill) :: Double
-          , realToFrac (colorAlpha fill) :: Double
-          )
-      void $
-        callMethod
-          "drawElements"
-          (rendererGl renderer)
-          (triangles, rendererIndexCount renderer, unsignedShort, 0 :: Int)
+drawPrimitive :: Renderer -> Camera2D -> RenderPrimitive -> JSM ()
+drawPrimitive renderer camera primitive = do
+  let
+    geometry = renderPrimitiveGeometry primitive
+    matrix = camera2DMatrix camera `multiply4` renderPrimitiveWorldMatrix primitive
+    fill = materialColor (renderPrimitiveMaterial primitive)
+  bindGeometry renderer (renderPrimitiveName primitive) geometry
+  uploadMatrix (rendererGl renderer) (rendererMatrixUniform renderer) matrix
+  void $
+    callMethod
+      "uniform4f"
+      (rendererGl renderer)
+      ( rendererColorUniform renderer
+      , realToFrac (colorRed fill) :: Double
+      , realToFrac (colorGreen fill) :: Double
+      , realToFrac (colorBlue fill) :: Double
+      , realToFrac (colorAlpha fill) :: Double
+      )
+  void $
+    callMethod
+      "drawElements"
+      (rendererGl renderer)
+      (triangles, length (geometry3DIndices geometry), unsignedShort, 0 :: Int)
 
-uploadCubeGeometry :: JSVal -> JSVal -> JSVal -> JSM ()
-uploadCubeGeometry gl vertexBuffer indexBuffer = do
-  vertices <- float32Array (geometry3DPositions unitCubeGeometry)
-  indices <- uint16Array (geometry3DIndices unitCubeGeometry)
+-- | Bind a primitive's buffers, uploading only when its geometry changed.
+--
+-- Every render used to re-upload every primitive's vertices and indices through
+-- jsaddle, which marshals a list one element per command: a single 48-segment
+-- ring cost roughly 900 commands, and a pointer move re-rendered the whole
+-- scene. The geometry is now compared before upload, so redrawing an unchanged
+-- scene costs nothing. Most of the scene really is static between ticks — ship
+-- bodies, heading markers and speed rings only change when the simulation does.
+--
+-- 'vertexAttribPointer' has to be re-issued per primitive because each one now
+-- has its own buffers, and it records whichever buffer is bound at the time.
+bindGeometry :: Renderer -> Text -> Geometry3D -> JSM ()
+bindGeometry renderer name geometry = do
+  cached <- cachedGeometry renderer name geometry
+  let
+    gl = rendererGl renderer
+  void $ callMethod "bindBuffer" gl (arrayBuffer, cachedVertexBuffer cached)
+  void $ callMethod "bindBuffer" gl (elementArrayBuffer, cachedIndexBuffer cached)
+  void $
+    callMethod
+      "vertexAttribPointer"
+      gl
+      (rendererPositionAttribute renderer, 3 :: Int, glFloat, False, 0 :: Int, 0 :: Int)
+
+cachedGeometry :: Renderer -> Text -> Geometry3D -> JSM CachedGeometry
+cachedGeometry renderer name geometry = do
+  cache <- liftIO $ readIORef (rendererGeometryCache renderer)
+  case Map.lookup name cache of
+    Just cached
+      | cachedGeometrySource cached == geometry -> pure cached
+      | otherwise -> do
+          uploadGeometry renderer (cachedVertexBuffer cached) (cachedIndexBuffer cached) geometry
+          store cached { cachedGeometrySource = geometry }
+    Nothing -> do
+      vertexBuffer <- createBufferOrFail renderer
+      indexBuffer <- createBufferOrFail renderer
+      uploadGeometry renderer vertexBuffer indexBuffer geometry
+      store (CachedGeometry geometry vertexBuffer indexBuffer)
+ where
+  store cached = do
+    liftIO $ modifyIORef' (rendererGeometryCache renderer) (Map.insert name cached)
+    pure cached
+
+-- | Reuse the entry's own buffers. Only the contents change, so the buffer
+-- objects never need recreating.
+uploadGeometry :: Renderer -> JSVal -> JSVal -> Geometry3D -> JSM ()
+uploadGeometry renderer vertexBuffer indexBuffer geometry = do
+  let gl = rendererGl renderer
+  vertices <- float32Array (geometry3DPositions geometry)
+  indices <- uint16Array (geometry3DIndices geometry)
   void $ callMethod "bindBuffer" gl (arrayBuffer, vertexBuffer)
   void $ callMethod "bufferData" gl (arrayBuffer, vertices, staticDraw)
   void $ callMethod "bindBuffer" gl (elementArrayBuffer, indexBuffer)
   void $ callMethod "bufferData" gl (elementArrayBuffer, indices, staticDraw)
 
+createBufferOrFail :: Renderer -> JSM JSVal
+createBufferOrFail renderer = do
+  buffer <- callMethod "createBuffer" (rendererGl renderer) ()
+  JS.maybeNullOrUndefined buffer >>= \case
+    Nothing -> logWebGlError "Could not create a WebGL buffer."
+    Just _ -> pure ()
+  pure buffer
+
 uploadMatrix :: JSVal -> JSVal -> Mat4 -> JSM ()
 uploadMatrix gl location matrix = do
   matrixArray <- float32Array (mat4ToColumnMajorList matrix)
   void $ callMethod "uniformMatrix4fv" gl (location, False, matrixArray)
-
-createBuffer :: JSVal -> JSM (Maybe JSVal)
-createBuffer gl = do
-  buffer <- callMethod "createBuffer" gl ()
-  JS.maybeNullOrUndefined buffer
 
 createShader :: JSVal -> Int -> Text -> JSM (Maybe JSVal)
 createShader gl shaderType source = do

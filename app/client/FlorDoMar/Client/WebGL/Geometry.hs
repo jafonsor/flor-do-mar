@@ -9,6 +9,8 @@ module FlorDoMar.Client.WebGL.Geometry
   , color
   , rect
   , rectangleGeometry
+  , ringStrokeGeometry
+  , strokePathGeometry
   , unitCubeGeometry
   , vertex2DFloats
   , vec3Floats
@@ -125,6 +127,69 @@ unitCubeGeometry =
         , 3, 7, 4, 3, 4, 0
         ]
     }
+
+strokePathGeometry :: [Vec3] -> Scalar -> Geometry3D
+strokePathGeometry points width =
+  Geometry3D
+    { geometry3DVertices = concat quads
+    , geometry3DIndices = concatMap quadIndices (zip [0 :: Int ..] quads)
+    }
+ where
+  quads = filter (not . null) $ fmap segmentQuad (zip points (drop 1 points))
+  halfWidth = width / 2
+
+  segmentQuad :: (Vec3, Vec3) -> [Vec3]
+  segmentQuad (start, finish)
+    | width <= 0 || lengthSquared <= 0 = []
+    | otherwise =
+        [ offsetPoint start perpendicular
+        , offsetPoint start (negatePoint perpendicular)
+        , offsetPoint finish (negatePoint perpendicular)
+        , offsetPoint finish perpendicular
+        ]
+   where
+    deltaX = vec3X finish - vec3X start
+    deltaY = vec3Y finish - vec3Y start
+    lengthSquared = (deltaX * deltaX) + (deltaY * deltaY)
+    lengthValue = sqrt lengthSquared
+    perpendicular = vec3 ((-deltaY / lengthValue) * halfWidth) ((deltaX / lengthValue) * halfWidth) 0
+
+  quadIndices :: (Int, [Vec3]) -> [Word16]
+  quadIndices (index, _) =
+    [ base
+    , base + 1
+    , base + 2
+    , base
+    , base + 2
+    , base + 3
+    ]
+   where
+    base = fromIntegral (index * 4)
+
+ringStrokeGeometry :: Vec3 -> Scalar -> Int -> Scalar -> Geometry3D
+ringStrokeGeometry center radius segments width =
+  strokePathGeometry (points <> take 1 points) width
+ where
+  segmentCount = max 3 segments
+  points =
+    [ vec3
+        (vec3X center + radius * cos angle)
+        (vec3Y center + radius * sin angle)
+        (vec3Z center)
+    | segment <- [0 .. segmentCount - 1]
+    , let angle = (2 * pi * fromIntegral segment) / fromIntegral segmentCount
+    ]
+
+offsetPoint :: Vec3 -> Vec3 -> Vec3
+offsetPoint point offset =
+  vec3
+    (vec3X point + vec3X offset)
+    (vec3Y point + vec3Y offset)
+    (vec3Z point + vec3Z offset)
+
+negatePoint :: Vec3 -> Vec3
+negatePoint point =
+  vec3 (-vec3X point) (-vec3Y point) (-vec3Z point)
 
 vertex2DFloats :: Vertex2D -> [Scalar]
 vertex2DFloats vertex =
