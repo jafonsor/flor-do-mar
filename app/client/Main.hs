@@ -29,10 +29,21 @@ main = do
 serverPort :: Int
 serverPort = 3911
 
+-- | Loopback only, and pinned to one address family on purpose.
+--
+-- Warp's default host is @*@, and on a dual-stack machine a second instance does
+-- not fail to bind: the first instance's address is taken, so it silently falls
+-- through to the other family and both processes end up listening on 3911. That
+-- is worse than an error. jsaddle keeps its per-connection sync handlers in
+-- process memory, so a page whose websocket lands on one instance and whose
+-- synchronous sync request lands on the other is told
+-- \"jsaddle missing sync message handler\" and its main thread stalls. Pinning
+-- the host makes a second instance fail loudly with \"address already in use\".
 serverSettings :: Warp.Settings
 serverSettings =
   Warp.setBeforeMainLoop logServerReady $
-    Warp.setPort serverPort Warp.defaultSettings
+    Warp.setHost "127.0.0.1" $
+      Warp.setPort serverPort Warp.defaultSettings
 
 logServerReady :: IO ()
 logServerReady = do
@@ -61,7 +72,7 @@ app combatConfig = do
           el "h1" $ text "Flor do Mar"
           elClass "div" "scenario" $ dynText (scenarioStatusText <$> snapshotDynamic)
 
-        battleView snapshotDynamic
+        navigationCommandEvents <- battleView snapshotDynamic (setupOverlayOpen <$> setupStateDynamic) (setupDebugOverlaysEnabled <$> setupStateDynamic)
 
         reloadPoll <- tickLossyFromPostBuildTime 0.5
         reloadResults <- performEvent $ liftIO (reloadRuntimeConfig localApi) <$ reloadPoll
@@ -78,7 +89,7 @@ app combatConfig = do
           shipPanel "Enemy" EnemyShip snapshotDynamic
           engagementPanel snapshotDynamic
 
-        commandEvents <- controls snapshotDynamic
+        commandEvents <- controls
         tickEvents <-
           widgetHold
             (tickLossyFromPostBuildTime (realToFrac (combatConfigTickSeconds combatConfig)))
@@ -106,7 +117,7 @@ app combatConfig = do
             attachWith
               (\fallback command -> liftIO (keepSnapshot fallback <$> combatApiSubmitCommand api command))
               (current snapshotDynamic)
-              (controlCommand commandEvents)
+              (leftmost [navigationCommandEvents, controlCommand commandEvents])
           reloadRequests =
             attachWith
               (\fallback _ -> liftIO (keepSnapshot fallback <$> combatApiObserveSnapshot api))
@@ -140,38 +151,18 @@ data ControlEvents t = ControlEvents
   { controlCommand :: Event t CombatCommand
   }
 
-controls :: Dynamic DomTimeline CombatSnapshot -> Widget x (ControlEvents DomTimeline)
-controls snapshotDynamic =
+controls :: Widget x (ControlEvents DomTimeline)
+controls =
   elClass "section" "controls" $ do
-    turnPortEvent <- button "Turn port"
-    turnStarboardEvent <- button "Turn starboard"
-    furlEvent <- button "Furl sails"
-    battleSailsEvent <- button "Battle sails"
-    fullSailsEvent <- button "Full sails"
     firePortEvent <- button "Fire port"
     fireStarboardEvent <- button "Fire starboard"
-    let
-      turnPortCommand =
-        attachWith
-          (\snapshot () -> SetHeading PlayerShip (Heading (playerHeading snapshot + 15)))
-          (current snapshotDynamic)
-          turnPortEvent
-      turnStarboardCommand =
-        attachWith
-          (\snapshot () -> SetHeading PlayerShip (Heading (playerHeading snapshot - 15)))
-          (current snapshotDynamic)
-          turnStarboardEvent
-      fixedCommands =
-        leftmost
-          [ SetSails PlayerShip SailsFurled <$ furlEvent
-          , SetSails PlayerShip BattleSails <$ battleSailsEvent
-          , SetSails PlayerShip FullSails <$ fullSailsEvent
-          , FireBroadside PlayerShip EnemyShip Port <$ firePortEvent
-          , FireBroadside PlayerShip EnemyShip Starboard <$ fireStarboardEvent
-          ]
     pure
       ControlEvents
-        { controlCommand = leftmost [turnPortCommand, turnStarboardCommand, fixedCommands]
+        { controlCommand =
+            leftmost
+              [ FireBroadside PlayerShip EnemyShip Port <$ firePortEvent
+              , FireBroadside PlayerShip EnemyShip Starboard <$ fireStarboardEvent
+              ]
         }
 
 setupOverlay :: [BoatConfig] -> SetupState -> Widget x (Event DomTimeline SetupAction)
@@ -184,8 +175,9 @@ setupOverlay boatConfigs setupState =
           el "h2" $ text "Engagement setup"
           playerSelection <- boatKindChoices "Player boat" boatConfigs (engagementSetupPlayerBoatKind selectedEngagement) SelectPlayerBoatKind
           enemySelection <- boatKindChoices "Enemy boat" boatConfigs (engagementSetupEnemyBoatKind selectedEngagement) SelectEnemyBoatKind
+          debugOverlays <- debugOverlayCheckbox (setupDebugOverlaysEnabled setupState)
           launchEvent <- button "Launch Engagement"
-          pure (leftmost [playerSelection, enemySelection, LaunchEngagement <$ launchEvent])
+          pure (leftmost [playerSelection, enemySelection, debugOverlays, LaunchEngagement <$ launchEvent])
  where
   selectedEngagement = setupSelectedEngagement setupState
 
@@ -200,6 +192,21 @@ boatKindChoices label boatConfigs selectedBoatKind toAction =
     elClass "div" (if boatConfigId boat == selectedBoatKind then "boat-kind selected" else "boat-kind") $ do
       clickEvent <- button (boatConfigDisplayName boat)
       pure (toAction (boatConfigId boat) <$ clickEvent)
+
+debugOverlayCheckbox :: Bool -> Widget x (Event DomTimeline SetupAction)
+debugOverlayCheckbox enabled =
+  elClass "label" "debug-overlay-toggle" $ do
+    debugCheckbox <-
+      inputElement $
+        (def :: InputElementConfig EventResult DomTimeline GhcjsDomSpace)
+          { _inputElementConfig_initialChecked = enabled
+          , _inputElementConfig_elementConfig =
+              (def :: ElementConfig EventResult DomTimeline GhcjsDomSpace)
+                { _elementConfig_initialAttributes = Map.fromList [("type", "checkbox")]
+                }
+          }
+    text " Debug overlays"
+    pure (SetDebugOverlaysEnabled <$> updated (_inputElement_checked debugCheckbox))
 
 engagementSetupFromSnapshot :: CombatSnapshot -> EngagementSetup
 engagementSetupFromSnapshot snapshot =
@@ -266,12 +273,6 @@ outcomeText outcome =
     Winner PlayerShip -> "Victory"
     Winner EnemyShip -> "Defeat"
     MutualDestruction -> "Mutual destruction"
-
-playerHeading :: CombatSnapshot -> Double
-playerHeading snapshot =
-  case findShipSnapshot PlayerShip snapshot of
-    Nothing -> 0
-    Just ship -> headingDegrees (shipSnapshotTargetHeading ship)
 
 findShipSnapshot :: ShipId -> CombatSnapshot -> Maybe ShipSnapshot
 findShipSnapshot identity snapshot =
@@ -378,6 +379,7 @@ stylesheet =
     , ".boat-kind-choice h3 { margin: 0 0 8px; font-size: 14px; color: #9fb6c9; }"
     , ".boat-kind { display: inline-block; margin: 0 8px 8px 0; }"
     , ".boat-kind.selected button { border-color: #77c7e8; background: #173f56; }"
+    , ".debug-overlay-toggle { display: block; margin: 16px 0; font-size: 14px; }"
     , "@media (max-width: 760px) { main { padding: 14px; } .app-header { display: block; } .status-grid { grid-template-columns: 1fr; } }"
     ]
 

@@ -49,6 +49,7 @@ executable flor-do-mar-client
   import:          warnings
   main-is:         Main.hs
   other-modules:
+    FlorDoMar.Client.BattleInput
     FlorDoMar.Client.BattleScene
     FlorDoMar.Client.BattleView
     FlorDoMar.Client.Render.Scene
@@ -59,13 +60,17 @@ executable flor-do-mar-client
   hs-source-dirs:  app/client
   build-depends:
     base >=4.20 && <4.21,
+    bytestring >=0.12 && <0.13,
     containers >=0.6 && <0.8,
     flor-do-mar,
+    http-types >=0.12 && <0.13,
     jsaddle >=0.9.9 && <0.10,
     jsaddle-warp >=0.9.9 && <0.10,
     linear >=1.23 && <1.24,
     reflex-dom-core >=0.8.1 && <0.9,
     text >=2.1 && <2.2,
+    time >=1.12 && <1.15,
+    wai >=3.2 && <3.3,
     warp >=3.4 && <3.5,
     websockets >=0.13 && <0.14
 
@@ -77,6 +82,7 @@ test-suite combat-test
     test
     app/client
   other-modules:
+    FlorDoMar.Client.BattleInput
     FlorDoMar.Client.BattleScene
     FlorDoMar.Client.Render.Scene
     FlorDoMar.Client.WebGL.Camera
@@ -84,6 +90,84 @@ test-suite combat-test
     FlorDoMar.Client.WebGL.Math
   build-depends:
     base >=4.20 && <4.21,
+    flor-do-mar,
+    linear >=1.23 && <1.24,
+    text >=2.1 && <2.2
+
+-- THROWAWAY diagnostic target for the "app blocks on hover" bug.
+-- Delete this stanza and test/DiagnosisHoverPerf.hs when Phase 6 cleanup runs.
+executable diagnosis-hover-perf
+  import:          warnings
+  main-is:         DiagnosisHoverPerf.hs
+  other-modules:
+    FlorDoMar.Client.BattleInput
+    FlorDoMar.Client.BattleScene
+    FlorDoMar.Client.Render.Scene
+    FlorDoMar.Client.WebGL.Camera
+    FlorDoMar.Client.WebGL.Geometry
+    FlorDoMar.Client.WebGL.Math
+  hs-source-dirs:
+    test
+    app/client
+  build-depends:
+    base >=4.20 && <4.21,
+    containers >=0.6 && <0.8,
+    flor-do-mar,
+    linear >=1.23 && <1.24,
+    text >=2.1 && <2.2,
+    time >=1.12 && <1.15
+
+-- THROWAWAY diagnostic target for the ship-divergence bug.
+-- Delete this stanza and test/DiagnosisDivergence.hs when cleanup runs.
+executable diagnosis-divergence
+  import:          warnings
+  main-is:         DiagnosisDivergence.hs
+  hs-source-dirs:  test
+  build-depends:
+    base >=4.20 && <4.21,
+    flor-do-mar,
+    text >=2.1 && <2.2
+
+
+
+-- THROWAWAY diagnostic target for the "curved order weaves sinusoidally" bug.
+-- Delete this stanza and test/DiagnosisTrajectoryShape.hs when cleanup runs.
+executable diagnosis-trajectory-shape
+  import:          warnings
+  main-is:         DiagnosisTrajectoryShape.hs
+  hs-source-dirs:  test
+  build-depends:
+    base >=4.20 && <4.21,
+    flor-do-mar,
+    text >=2.1 && <2.2
+
+-- THROWAWAY experiment comparing steering laws for the weaving bug.
+executable diagnosis-steering-experiment
+  import:          warnings
+  main-is:         DiagnosisSteeringLaws.hs
+  hs-source-dirs:  test
+  build-depends:
+    base >=4.20 && <4.21,
+    flor-do-mar,
+    text >=2.1 && <2.2
+
+-- Position sweep for the "freezes at certain mouse positions" report.
+executable scan-hover-positions
+  import:          warnings
+  main-is:         ScanHoverPositions.hs
+  other-modules:
+    FlorDoMar.Client.BattleInput
+    FlorDoMar.Client.BattleScene
+    FlorDoMar.Client.Render.Scene
+    FlorDoMar.Client.WebGL.Camera
+    FlorDoMar.Client.WebGL.Geometry
+    FlorDoMar.Client.WebGL.Math
+  hs-source-dirs:
+    test
+    app/client
+  build-depends:
+    base >=4.20 && <4.21,
+    containers >=0.6 && <0.8,
     flor-do-mar,
     linear >=1.23 && <1.24,
     text >=2.1 && <2.2
