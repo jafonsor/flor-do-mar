@@ -5,13 +5,19 @@
 module Main (main) where
 
 import Control.Monad.IO.Class (liftIO)
+import Data.ByteString.Lazy (ByteString)
+import Data.ByteString.Lazy qualified as LBS
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import FlorDoMar.Client.BattleView (battleView)
 import FlorDoMar.Combat
 import Language.Javascript.JSaddle.Warp (jsaddleApp, jsaddleOr)
+import Network.HTTP.Types qualified as Http
+import Network.Wai qualified as Wai
 import Network.Wai.Handler.Warp qualified as Warp
 import Network.WebSockets (defaultConnectionOptions)
 import Reflex.Dom.Core
@@ -23,11 +29,106 @@ main = do
   runtimeConfigDirectory <- runtimeCombatConfigDirectory
   combatConfig <- startupConfigOrDie =<< loadCombatConfig runtimeConfigDirectory
   logConfigDirectory runtimeConfigDirectory
-  application <- jsaddleOr defaultConnectionOptions (mainWidget (app combatConfig)) jsaddleApp
-  Warp.runSettings serverSettings application
+  epoch <- processEpoch
+  application <-
+    jsaddleOr
+      defaultConnectionOptions
+      (mainWidget (app combatConfig))
+      jsaddleApp
+  Warp.runSettings serverSettings (serveEpochPage epoch application)
 
 serverPort :: Int
 serverPort = 3911
+
+-- | Identifies this client process to the pages it serves.
+--
+-- jsaddle keeps a page's sync handlers in process memory, so a page that
+-- outlives the process serving it can never make another callback: every
+-- synchronous sync POST is answered with @jsaddle missing sync message handler@,
+-- and the page's DOM stays on screen while its simulation stops advancing. It
+-- looks frozen while its main thread is perfectly healthy.
+--
+-- That is the normal edit/rebuild/restart loop, so a page has to be able to
+-- notice that the process behind it changed and reload itself. This token is how
+-- it notices: the page is served with the token of the process that served it,
+-- and polls @\/epoch@ for the token of the process that is serving it now.
+processEpoch :: IO Text
+processEpoch = do
+  now <- getPOSIXTime
+  pure . Text.pack . show $ (round (realToFrac now * 1000) :: Integer)
+
+-- | Serve the page shell with the restart check in it.
+--
+-- The document jsaddle serves is an empty shell that loads @\/jsaddle.js@ and
+-- lets the app build the body, so the check has to be injected here rather than
+-- rendered by the widget: a page that has already lost its session cannot reach
+-- the widget at all.
+--
+-- The check compares the token of the process that served this document with the
+-- token of whoever answers @\/epoch@ now. A match means the page still belongs to
+-- this process and it boots normally; a mismatch means the peer is gone, so it
+-- boots empty and a fresh copy is loaded. Storing the token means a page that
+-- somehow keeps seeing a mismatch reloads once instead of looping.
+serveEpochPage :: Text -> Wai.Middleware
+serveEpochPage epoch application request respond
+  -- A websocket upgrade is a GET to the same path as the page itself, so the
+  -- upgrade has to be recognised here: answering it with the page would leave
+  -- jsaddle unable to connect at all.
+  | isWebSocketUpgrade request = application request respond
+  | otherwise =
+      case (Wai.requestMethod request, Wai.pathInfo request) of
+        ("GET", []) -> respond (Wai.responseLBS Http.status200 [("Content-Type", "text/html; charset=utf-8")] (indexPage epoch))
+        ("GET", ["epoch"]) -> respond (epochResponse epoch)
+        _ -> application request respond
+
+isWebSocketUpgrade :: Wai.Request -> Bool
+isWebSocketUpgrade request =
+  lookup "Upgrade" (Wai.requestHeaders request) == Just "websocket"
+
+indexPage :: Text -> ByteString
+indexPage epoch =
+  LBS.fromStrict . encodeUtf8 $
+    Text.replace
+      "</head>"
+      ("<script>" <> watchScript epoch <> "</script></head>")
+      (decodeUtf8 (LBS.toStrict jsaddleIndexHtml))
+
+jsaddleIndexHtml :: ByteString
+jsaddleIndexHtml =
+  "<!DOCTYPE html>\n<html>\n<head>\n<title>JSaddle</title>\n</head>\n<body>\n</body>\n<script src=\"/jsaddle.js\"></script>\n</html>\n"
+
+watchScript :: Text -> Text
+watchScript epoch =
+  Text.unlines
+    [ "(function () {"
+    , "  var token = \"" <> epoch <> "\";"
+    , "  var reloadForNewClient = function () {"
+    , "    try {"
+    , "      var stored = window.localStorage.getItem('flor-do-mar-epoch');"
+    , "      window.localStorage.setItem('flor-do-mar-epoch', token);"
+    , "      if (stored !== null && stored !== token) { window.location.reload(); return true; }"
+    , "    } catch (error) { return false; }"
+    , "    return false;"
+    , "  };"
+    , "  if (reloadForNewClient()) return;"
+    , "  setInterval(function () {"
+    , "    var request = new XMLHttpRequest();"
+    , "    request.open('GET', '/epoch', true);"
+    , "    request.onreadystatechange = function () {"
+    , "      if (request.readyState !== XMLHttpRequest.DONE || request.status !== 200) return;"
+    , "      if (request.responseText !== token) window.location.reload();"
+    , "    };"
+    , "    request.send();"
+    , "  }, 2000);"
+    , "})();"
+    ]
+
+epochResponse :: Text -> Wai.Response
+epochResponse epoch =
+  Wai.responseLBS
+    Http.status200
+    [("Content-Type", "text/plain; charset=utf-8"), ("Cache-Control", "no-store")]
+    (LBS.fromStrict (encodeUtf8 epoch))
 
 -- | Loopback only, and pinned to one address family on purpose.
 --
