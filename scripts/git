@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Agent-facing git entry point.
 #
-# A bare `git` is refused in this harness, and so is /usr/bin/git: on this machine
-# that path is the Apple/Xcode build, and the denial follows the resolved binary
-# rather than the command word. A nix-built git runs fine, so this hands over to
-# one and passes every argument through untouched.
+# Git here is the nix-built one, not /usr/bin/git, which on this machine is the
+# Apple/Xcode build. This hands over to the nix-built git the dev shell supplies
+# and passes every argument through untouched, so the version stays pinned even
+# when the shell is stale.
 #
 # Call ./scripts/git instead of `git`. Override the binary with FLOR_DO_MAR_GIT
 # when the store path below is collected or you want a different git.

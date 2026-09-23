@@ -18,7 +18,7 @@ Movement tests and browser-driving traps that produce false signals. See `docs/a
 
 ### Git
 
-Use `./scripts/git`, not `git` — the harness refuses the git PATH resolves to here. See `docs/agents/git-workflow.md` before committing, switching branches, or rewriting history.
+Use `./scripts/git` for every git call, so the version in play is the nix-built one the dev shell supplies. A "tool not found" usually means the shell predates the current flake — see `docs/agents/git-workflow.md` before committing, switching branches, or rewriting history.
 
 ### Recording lessons
 

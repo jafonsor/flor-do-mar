@@ -9,14 +9,30 @@ Git usage guidelines for this repo.
 ./scripts/git log --oneline -5
 ```
 
-Arguments pass through untouched, so use it exactly as you would git. A bare `git`
-does not run here, so call the wrapper every time.
+Arguments pass through untouched, so use it exactly as you would git, and call the
+wrapper every time so the git in play is always the same nix-built one.
 
 It pins `/nix/store/304vhl9qr5774qkv5rrqa0xbg429j2kk-git-2.55.0/bin/git` and says
 what to do if that path is collected. Check it with `./scripts/git rev-parse
 --is-inside-work-tree`; override it for one command with
 `FLOR_DO_MAR_GIT=/nix/store/…/bin/git ./scripts/git …`, and find candidates with
 `ls -d /nix/store/*git-*/bin/git`.
+
+## A missing tool usually means a stale dev shell
+
+The dev shell supplies the toolchain, git included via `pkgs.git` in `flake.nix`.
+`direnv` applies a flake change only when the directory is re-entered, so a shell
+opened before that change lacks whatever the change added, and a command that is
+present in the flake reports that it is not found.
+
+```bash
+command -v git    # want /nix/store/…-git-2.55.0/bin/git, not /usr/bin/git
+```
+
+A path outside the store means the shell predates the current flake. Leave and
+re-enter the directory to let `direnv` apply it, or run `direnv reload`. A bare
+`git` then runs fine, once the shell it runs in is current; the wrapper is still
+the call to make, so the version stays pinned.
 
 ## Never `reset --hard` on uncommitted work
 
