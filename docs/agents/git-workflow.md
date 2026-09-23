@@ -15,10 +15,22 @@ produces a file-permission error you could escalate.
 Escalating does not help. A `danger-full-access` retry of the same command fails
 identically, because the name is denied before the sandbox is consulted.
 
-The block is on the name, not on where the binary lives, so adding git to the dev
-shell would change nothing: the dev shell already inherits `/usr/bin/git`, and a
-`nix develop --command git` still hits the deny-list. The binary in the nix store
-runs when you give its absolute path:
+Adding git to the dev shell does not help either, and this is worth proving to
+yourself before you try it. Inside a `nix develop` shell, git is already on PATH
+and still refused:
+
+```
+$ nix develop --command bash -c 'command -v git'
+/usr/bin/git
+$ nix develop --command bash -c 'git --version'
+error: tool 'git' not found
+```
+
+The shell resolves the binary; the invocation of it by name is what gets denied.
+A tool that is not on PATH could not print a path at all, so no amount of adding
+packages to `flake.nix` reaches this: the check is on the command word, ahead of
+PATH lookup and ahead of the sandbox. The binary in the nix store runs when you
+give its absolute path:
 
 ```bash
 export GIT=/nix/store/304vhl9qr5774qkv5rrqa0xbg429j2kk-git-2.55.0/bin/git
