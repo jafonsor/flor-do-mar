@@ -78,7 +78,7 @@
               pkgs.cabal-install
               pkgs.ghcid
               haskellPackages.haskell-language-server
-              pkgs.nodejs_22
+              pkgs.nodejs_24
               playwrightCli
               pkgs.playwright-driver.browsers
               pkgs.nixfmt

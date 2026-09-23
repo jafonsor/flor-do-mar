@@ -12,6 +12,10 @@ This repo uses the default five-role triage vocabulary. See `docs/agents/triage-
 
 This repo uses a single-context domain documentation layout. See `docs/agents/domain.md`.
 
+### Testing and local tooling
+
+Movement tests and browser-driving traps that produce false signals. See `docs/agents/testing-and-tooling.md`.
+
 ### Frontend checks
 
 After frontend changes, run `nix develop --command cabal build flor-do-mar-client` to catch client compile errors before handoff.
