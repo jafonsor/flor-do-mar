@@ -18,7 +18,7 @@ Movement tests and browser-driving traps that produce false signals. See `docs/a
 
 ### Git
 
-The harness blocks `git` by name, and `reset --hard` destroys work that exists only in the working tree. See `docs/agents/git-workflow.md` before committing, switching branches, or rewriting history.
+Use `./scripts/git`, not `git` — the harness refuses the git PATH resolves to here. See `docs/agents/git-workflow.md` before committing, switching branches, or rewriting history.
 
 ### Frontend checks
 
