@@ -5,6 +5,7 @@ module Main (main) where
 import Control.Monad (replicateM_)
 import Data.Text (Text)
 import Data.Text qualified as Text
+import FlorDoMar.Client.BattleInput
 import FlorDoMar.Client.BattleScene
 import FlorDoMar.Client.Render.Scene
 import FlorDoMar.Client.WebGL.Camera
@@ -31,18 +32,43 @@ main = do
   testLocalApiStartsCaravelaDuel
   testConfiguredLocalApiStartsBigVsSmall
   testConfiguredMovementPhysics
+  testNavigationPlannerClampsAndCommitsOrders
+  testNavigationProjectionMatchesExecution
+  testNavigationSteeringDoesNotWeave
+  testNavigationArrivalPreservesSpeedIntent
+  testMouseNavigationCommandLifecycle
+  testStoppedNavigationOrderBuildsWay
+  testBroadsideKeepsActiveNavigationOrder
+  testDisabledShipsClearAndIgnoreNavigation
+  testNavigationSafetyCapIsSurfaced
+  testLocalApiExposesNavigationOrder
+  testEnemyOrbitAutopilotIssuesNavigationOrders
   testConfiguredBroadsideTuning
   testConfiguredLocalApiBroadsideTuning
   testConfiguredMovementSnapshot
   testConfiguredLocalApiHotReloadsLiveEngagement
+  testHotReloadPreservesCommittedNavigationWaypoint
   testInvalidReloadKeepsLastValidConfigAndSnapshot
   testHotReloadPreservesDamageAcrossHullClamp
   testConfiguredLocalApiRestartsSelectedEngagement
   testSetupOverlayState
+  testSetupDebugOverlayState
   testLocalApiQueuesCommandsUntilTick
   testLocalApiReportsTerminalState
   testInitialBattleRenderScene
   testDamagedBattleRenderSceneTint
+  testActiveNavigationRenderScene
+  testEnemyDebugNavigationRenderScene
+  testBattleInputHoverIntent
+  testBattleInputMouseNavigationGesture
+  testHoverNavigationRenderScene
+  testHoverNavigationIsHiddenOutsideActiveBattleView
+  testSetupOverlayBlocksNavigation
+  testFinishedScenarioBlocksNavigation
+  testFinishedBattleRenderSceneHidesPlanning
+  testSceneGraphTraversal
+  testStrokePathRenderPrimitive
+  testRingStrokeRenderPrimitive
   putStrLn "combat-test: OK"
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -56,6 +82,11 @@ assertApprox label expected actual =
   if abs (expected - actual) < 0.0001
     then pure ()
     else die $ label <> ": expected " <> show expected <> ", got " <> show actual
+
+assertPoint :: String -> Point -> Point -> IO ()
+assertPoint label expected actual = do
+  assertApprox (label <> " x") (pointX expected) (pointX actual)
+  assertApprox (label <> " y") (pointY expected) (pointY actual)
 
 assertApproxScalar :: String -> Scalar -> Scalar -> IO ()
 assertApproxScalar label expected actual =
@@ -92,6 +123,12 @@ expectLeft label result =
   case result of
     Left err -> pure err
     Right _ -> die $ label <> ": expected Left, got Right"
+
+expectJust :: String -> Maybe a -> IO a
+expectJust label value =
+  case value of
+    Just result -> pure result
+    Nothing -> die $ label <> ": expected Just, got Nothing"
 
 expectShipSnapshot :: String -> ShipId -> CombatSnapshot -> IO ShipSnapshot
 expectShipSnapshot label identity snapshot =
@@ -290,24 +327,409 @@ testConfiguredMovementPhysics :: IO ()
 testConfiguredMovementPhysics = do
   config <- expectRight "load packaged config for movement physics" =<< loadRuntimeCombatConfig
   let
-    initialState = configuredDefaultEngagement config
-    turningState = tickConfiguredCombat config [SetHeading PlayerShip (Heading 180)] initialState
+    inertialConfig = config {combatConfigBoats = fmap (\boat -> boat {boatConfigYawAcceleration = 2.5}) (combatConfigBoats config)}
+    initialState = configuredDefaultEngagement inertialConfig
+    acceleratingState = tickConfiguredCombat inertialConfig [SetHeading PlayerShip (Heading 90), SetTargetSpeed PlayerShip 2.5] initialState
+    acceleratingPlayer = combatPlayer acceleratingState
+    turningState = tickConfiguredCombat inertialConfig [] acceleratingState
     turningPlayer = combatPlayer turningState
-    fullSailsState = tickConfiguredCombat config [SetSails PlayerShip FullSails] turningState
-    furledState = tickConfiguredCombat config [SetSails PlayerShip SailsFurled] fullSailsState
-    halfSecondConfig = config {combatConfigPhysics = PhysicsConfig 0.5}
-    halfSecondState = tickConfiguredCombat halfSecondConfig [] (configuredDefaultEngagement halfSecondConfig)
-    halfSecondPlayer = combatPlayer halfSecondState
-  assertEqual "heading command updates configured target" (Heading 180) (shipTargetHeading turningPlayer)
-  assertApprox "heading turns gradually at low speed" 6 (headingDegrees (shipHeading turningPlayer))
-  assertApprox "battle sails accelerate from rest" 1.6 (shipCurrentSpeed turningPlayer)
-  assertApprox "movement uses physical heading" 1.273 (pointX (shipPosition turningPlayer))
-  assertApprox "movement uses configured tick seconds" (1.6 * 0.8 * sin (6 * pi / 180)) (pointY (shipPosition turningPlayer))
+    starboardAcceleratingState = tickConfiguredCombat inertialConfig [SetHeading PlayerShip (Heading (-90)), SetTargetSpeed PlayerShip 2.5] initialState
+    starboardTurningPlayer = combatPlayer (tickConfiguredCombat inertialConfig [] starboardAcceleratingState)
+    deceleratingState = tickConfiguredCombat inertialConfig [SetTargetSpeed PlayerShip 0] turningState
+    deceleratingPlayer = combatPlayer deceleratingState
+    negativeTargetState = tickConfiguredCombat inertialConfig [SetTargetSpeed PlayerShip (-1)] turningState
+    negativeTargetPlayer = combatPlayer negativeTargetState
+    maximumTargetState = tickConfiguredCombat inertialConfig [SetTargetSpeed PlayerShip 100] initialState
+    maximumTargetPlayer = combatPlayer maximumTargetState
+    easingState =
+      (configuredDefaultEngagement inertialConfig)
+        { combatPlayer =
+            (combatPlayer (configuredDefaultEngagement inertialConfig))
+              { shipCurrentSpeed = 4
+              , shipTargetSpeed = 4
+              , shipCurrentYawRate = 5
+              }
+        }
+    easingPlayer = combatPlayer (tickConfiguredCombat inertialConfig [] easingState)
+  big <- expectBoatConfig "configured big boat has yaw tuning" "big" inertialConfig
+  assertApprox "ideal turn speed is configured" 4 (boatConfigIdealTurnSpeed big)
+  assertApprox "yaw acceleration is configured" 2.5 (boatConfigYawAcceleration big)
+  assertEqual "heading command updates configured target" (Heading 90) (shipTargetHeading acceleratingPlayer)
+  assertApprox "continuous target speed is retained" 2.5 (shipTargetSpeed acceleratingPlayer)
+  assertApprox "stopped ship cannot turn" 0 (headingDegrees (shipHeading acceleratingPlayer))
+  assertApprox "stopped ship has zero yaw rate" 0 (shipCurrentYawRate acceleratingPlayer)
+  assertApprox "ship accelerates straight ahead before turning" 1.6 (shipCurrentSpeed acceleratingPlayer)
+  assertApprox "straight-ahead acceleration advances position" 1.28 (pointX (shipPosition acceleratingPlayer))
+  assertApprox "yaw rate accelerates toward rudder-limited target" 2 (shipCurrentYawRate turningPlayer)
+  assertApprox "yaw rate retains starboard sign" (-2) (shipCurrentYawRate starboardTurningPlayer)
+  assertApprox "heading advances from signed yaw rate" 1.6 (headingDegrees (shipHeading turningPlayer))
   assertEqual "physical heading keeps port broadside ready" BroadsideReady (canFireBroadside turningState PlayerShip EnemyShip Port)
-  assertApprox "full sails continue acceleration toward max speed" 3.2 (shipCurrentSpeed (combatPlayer fullSailsState))
-  assertApprox "furled sails decelerate toward zero" 0.8 (shipCurrentSpeed (combatPlayer furledState))
-  assertApprox "half-second tick accelerates by configured per-second value" 1 (shipCurrentSpeed halfSecondPlayer)
-  assertApprox "half-second tick advances by speed times tick seconds" 0.5 (pointX (shipPosition halfSecondPlayer))
+  assertApprox "continuous speed decelerates toward requested speed" 0.1 (shipCurrentSpeed deceleratingPlayer)
+  assertApprox "negative target speed clamps to zero" 0 (shipTargetSpeed negativeTargetPlayer)
+  assertApprox "target speed clamps to ship maximum" 4 (shipTargetSpeed maximumTargetPlayer)
+  assertApprox "yaw rate eases out without turn intent" 3 (shipCurrentYawRate easingPlayer)
+  assertApprox "yaw inertia advances heading while easing out" 2.4 (headingDegrees (shipHeading easingPlayer))
+
+testNavigationPlannerClampsAndCommitsOrders :: IO ()
+testNavigationPlannerClampsAndCommitsOrders = do
+  let
+    tickSeconds = 0.25
+    initialState =
+      caravelaDuel
+        { combatPlayer =
+            (combatPlayer caravelaDuel)
+              { shipCurrentSpeed = 4
+              , shipTargetSpeed = 4
+              }
+        }
+    player = combatPlayer initialState
+    tightRequest = Point 0.5 0
+    plan = planNavigation tickSeconds navigationMovement player tightRequest
+    commanded = tickCombatWith tickSeconds (const navigationMovement) [IssueNavigationOrder PlayerShip tightRequest] initialState
+    replacementRequest = Point 30 12
+    replaced = tickCombatWith tickSeconds (const navigationMovement) [IssueNavigationOrder PlayerShip replacementRequest] commanded
+    changedMovement = navigationMovement {movementTurnRate = 30}
+    afterPhysicsChange = tickCombatWith tickSeconds (const changedMovement) [] commanded
+    enemyCommanded = tickCombatWith tickSeconds (const navigationMovement) [IssueNavigationOrder EnemyShip (Point 20 65)] initialState
+  committed <- expectNavigationOrder "player navigation order is committed" (combatPlayer commanded)
+  replacement <- expectNavigationOrder "new navigation order replaces the active order" (combatPlayer replaced)
+  preserved <- expectNavigationOrder "committed waypoint survives physics changes" (combatPlayer afterPhysicsChange)
+  enemyOrder <- expectNavigationOrder "enemy accepts navigation orders" (combatEnemy enemyCommanded)
+  assertEqual "tight request is marked clamped" True (navigationPlanWasClamped plan)
+  assertPoint "planner retains requested waypoint" tightRequest (navigationPlanRequestedWaypoint plan)
+  assertPoint "order retains requested waypoint" tightRequest (navigationRequestedWaypoint committed)
+  assertPoint "command commits planner reachable waypoint" (navigationPlanReachableWaypoint plan) (navigationReachableWaypoint committed)
+  assertEqual "clamped waypoint is farther than tight request" True (pointX (navigationReachableWaypoint committed) > pointX tightRequest)
+  assertPoint "replacement stores its own requested waypoint" replacementRequest (navigationRequestedWaypoint replacement)
+  assertEqual "replacement removes the prior waypoint" False (navigationReachableWaypoint replacement == navigationReachableWaypoint committed)
+  assertPoint "committed waypoint remains fixed after command time" (navigationReachableWaypoint committed) (navigationReachableWaypoint preserved)
+  assertPoint "enemy order stores requested waypoint" (Point 20 65) (navigationRequestedWaypoint enemyOrder)
+  assertPlannerSamplesStartAtZero plan
+  assertEqual "planner samples have sequential tick offsets" [0 .. length (navigationPlanSamples plan) - 1] (fmap trajectorySampleTickOffset (navigationPlanSamples plan))
+
+testNavigationProjectionMatchesExecution :: IO ()
+testNavigationProjectionMatchesExecution = do
+  let
+    tickSeconds = 0.25
+    requestedWaypoint = Point 26 11
+    initialState =
+      caravelaDuel
+        { combatPlayer =
+            (combatPlayer caravelaDuel)
+              { shipCurrentSpeed = 3
+              , shipTargetSpeed = 3
+              }
+        }
+    initialPlayer = combatPlayer initialState
+    plan = planNavigation tickSeconds navigationMovement initialPlayer requestedWaypoint
+    expectedSamples = drop 1 (navigationPlanSamples plan)
+    executionCommands = [IssueNavigationOrder PlayerShip requestedWaypoint] : replicate (length expectedSamples - 1) []
+    executedStates = drop 1 (scanl (flip (tickCombatWith tickSeconds (const navigationMovement))) initialState executionCommands)
+  assertEqual "planner exposes selected samples only through its sample list" (length expectedSamples + 1) (length (navigationPlanSamples plan))
+  mapM_ (uncurry assertSampleMatchesShip) (zip expectedSamples (fmap combatPlayer executedStates))
+
+testNavigationArrivalPreservesSpeedIntent :: IO ()
+testNavigationArrivalPreservesSpeedIntent = do
+  let
+    tickSeconds = 0.25
+    requestedWaypoint = Point 16 0
+    initialState =
+      caravelaDuel
+        { combatPlayer =
+            (combatPlayer caravelaDuel)
+              { shipCurrentSpeed = 4
+              , shipTargetSpeed = 3
+              }
+        }
+    ordered = tickCombatWith tickSeconds (const navigationMovement) [IssueNavigationOrder PlayerShip requestedWaypoint] initialState
+    arrived = advanceUntilNavigationClears 100 (tickCombatWith tickSeconds (const navigationMovement) []) ordered
+    orderedPlayer = combatPlayer ordered
+    arrivedPlayer = combatPlayer arrived
+  order <- expectNavigationOrder "navigation order remains active before arrival" orderedPlayer
+  assertEqual "arrival clears active waypoint" Nothing (shipNavigationOrder arrivedPlayer)
+  assertApprox "arrival leaves post-waypoint speed intent" (navigationPostWaypointSpeed order) (shipTargetSpeed arrivedPlayer)
+
+testNavigationSteeringDoesNotWeave :: IO ()
+testNavigationSteeringDoesNotWeave = do
+  let
+    tickSeconds = 0.25
+    -- A long order that is mostly forward but well off the bow. Anything that
+    -- hunts around its bearing shows up here as repeated turn reversals.
+    requestedWaypoint = Point 60 25
+    initialState =
+      caravelaDuel
+        { combatPlayer =
+            (combatPlayer caravelaDuel)
+              { shipCurrentSpeed = 0
+              , shipTargetSpeed = 4
+              }
+        }
+    initialPlayer = combatPlayer initialState
+    ordered = tickCombatWith tickSeconds (const navigationMovement) [IssueNavigationOrder PlayerShip requestedWaypoint] initialState
+    execution = take 200 (iterate (tickCombatWith tickSeconds (const navigationMovement) []) ordered)
+    executed = takeWhile (maybe False (const True) . shipNavigationOrder . combatPlayer) execution
+    reachedWaypoint = length executed < length execution
+    yawRates = fmap (shipCurrentYawRate . combatPlayer) executed
+    turnRuns = fmap signum (filter ((> 1e-9) . abs) yawRates)
+    reversals = length (filter id (zipWith (/=) turnRuns (drop 1 turnRuns)))
+
+  -- Relay steering reverses turn direction every time yaw inertia carries the
+  -- ship past its bearing, so one order produced several reversals and a path
+  -- 1.45x the direct distance. A proportional command settles instead.
+  assertEqual "navigation steering holds one turn direction along the approach" 0 reversals
+  assertEqual "navigation steering settles on the waypoint instead of orbiting it" True reachedWaypoint
+
+  -- The command must still be proportional rather than a relay: a large error
+  -- saturates at the whole turn rate, while a smaller one asks for strictly
+  -- less. A sign-only law cannot tell the two apart.
+  assertApprox "error beyond the proportional band saturates at full rudder authority"
+    (movementTurnRate navigationMovement)
+    (abs (targetYawRate navigationMovement (steeringProbe 180)))
+  assertApprox "error inside the proportional band asks for yaw below full rudder authority"
+    (60 / navigationHeadingCorrectionSeconds)
+    (abs (targetYawRate navigationMovement (steeringProbe 60)))
+
+  -- No turn intent still settles to zero, so a ship without a waypoint eases
+  -- out of its turn according to yaw inertia rather than holding a command.
+  assertApprox "no turn intent commands zero yaw rate"
+    0
+    (targetYawRate navigationMovement initialPlayer)
+
+steeringProbe :: Double -> Ship
+steeringProbe headingError =
+  (combatPlayer caravelaDuel)
+    { shipCurrentSpeed = movementIdealTurnSpeed navigationMovement
+    , shipHeading = Heading 0
+    , shipTargetHeading = Heading headingError
+    }
+
+testMouseNavigationCommandLifecycle :: IO ()
+testMouseNavigationCommandLifecycle = do
+  let
+    tickSeconds = 0.25
+    requestedWaypoint = Point 0.5 0
+    initialState =
+      caravelaDuel
+        { combatPlayer =
+            (combatPlayer caravelaDuel)
+              { shipCurrentSpeed = 3
+              , shipTargetSpeed = 3
+              }
+        }
+    clickPlan = planNavigation tickSeconds navigationMovement (combatPlayer initialState) requestedWaypoint
+    clicked =
+      tickCombatWith
+        tickSeconds
+        (const navigationMovement)
+        [IssueNavigationOrder PlayerShip requestedWaypoint]
+        initialState
+    dragged =
+      tickCombatWith
+        tickSeconds
+        (const navigationMovement)
+        [SetNavigationPostWaypointSpeed PlayerShip 4.5]
+        clicked
+    stoppedState =
+      initialState
+        { combatPlayer =
+            (combatPlayer initialState)
+              { shipCurrentSpeed = 0
+              , shipTargetSpeed = 0
+              }
+        }
+    arrivedBeforeRelease =
+      tickCombatWith
+        tickSeconds
+        (const navigationMovement)
+        [IssueNavigationOrder PlayerShip (Point 1 0)]
+        stoppedState
+    releasedAfterArrival =
+      tickCombatWith
+        tickSeconds
+        (const navigationMovement)
+        [SetNavigationPostWaypointSpeed PlayerShip 4.5]
+        arrivedBeforeRelease
+    replacementWaypoint = Point (-24) 18
+    replaced =
+      tickCombatWith
+        tickSeconds
+        (const navigationMovement)
+        [IssueNavigationOrder PlayerShip replacementWaypoint]
+        dragged
+  clickOrder <- expectNavigationOrder "mouse down commits a navigation order" (combatPlayer clicked)
+  draggedOrder <- expectNavigationOrder "drag release keeps the navigation order active" (combatPlayer dragged)
+  replacementOrder <- expectNavigationOrder "new mouse navigation order replaces active order" (combatPlayer replaced)
+  assertApprox
+    "plain click inherits arrival speed as post-waypoint speed"
+    (navigationPlanArrivalSpeed clickPlan)
+    (navigationPostWaypointSpeed clickOrder)
+  assertEqual "tight mouse-down request is clamped" True (navigationPlanWasClamped clickPlan)
+  assertPoint "mouse down retains the raw requested waypoint" requestedWaypoint (navigationRequestedWaypoint clickOrder)
+  assertPoint "mouse down commits the planner reachable waypoint" (navigationPlanReachableWaypoint clickPlan) (navigationReachableWaypoint clickOrder)
+  assertApprox "drag release updates active order post-waypoint speed" 4.5 (navigationPostWaypointSpeed draggedOrder)
+  assertApprox "drag release leaves current target speed alone before arrival" 3 (shipTargetSpeed (combatPlayer dragged))
+  assertEqual "near waypoint clears before release" Nothing (shipNavigationOrder (combatPlayer arrivedBeforeRelease))
+  assertApprox "release after arrival sets current target speed" 4.5 (shipTargetSpeed (combatPlayer releasedAfterArrival))
+  assertPoint "replacement order takes effect immediately on its tick" replacementWaypoint (navigationRequestedWaypoint replacementOrder)
+
+testStoppedNavigationOrderBuildsWay :: IO ()
+testStoppedNavigationOrderBuildsWay = do
+  let
+    tickSeconds = 0.25
+    stoppedState =
+      caravelaDuel
+        { combatPlayer =
+            (combatPlayer caravelaDuel)
+              { shipCurrentSpeed = 0
+              , shipTargetSpeed = 0
+              }
+        }
+    ordered =
+      tickCombatWith
+        tickSeconds
+        (const navigationMovement)
+        [IssueNavigationOrder PlayerShip (Point 40 20)]
+        stoppedState
+    player = combatPlayer ordered
+  assertApprox "stopped navigation sets cruise target speed" (movementBattleSpeed navigationMovement) (shipTargetSpeed player)
+  assertApprox "stopped navigation builds way before turning" 1 (shipCurrentSpeed player)
+  assertApprox "stopped navigation accelerates straight ahead" 0.25 (pointX (shipPosition player))
+  assertApprox "stopped navigation has not turned before building way" 0 (headingDegrees (shipHeading player))
+
+testBroadsideKeepsActiveNavigationOrder :: IO ()
+testBroadsideKeepsActiveNavigationOrder = do
+  let
+    ordered = tickCombat [IssueNavigationOrder PlayerShip (Point 40 20)] caravelaDuel
+    fired = tickCombat [FireBroadside PlayerShip EnemyShip Port] ordered
+  orderBeforeFiring <- expectNavigationOrder "navigation order before broadside" (combatPlayer ordered)
+  orderAfterFiring <- expectNavigationOrder "navigation order after broadside" (combatPlayer fired)
+  assertEqual "broadside damages independently of navigation" 75 (shipHull (combatEnemy fired))
+  assertEqual "broadside does not mutate the active navigation order" orderBeforeFiring orderAfterFiring
+
+testDisabledShipsClearAndIgnoreNavigation :: IO ()
+testDisabledShipsClearAndIgnoreNavigation = do
+  let
+    ordered = tickCombat [IssueNavigationOrder PlayerShip (Point 40 20)] caravelaDuel
+    disabled =
+      ordered
+        { combatPlayer =
+            (combatPlayer ordered)
+              { shipHull = 0
+              }
+        }
+    attemptedNavigation =
+      tickCombat
+        [ IssueNavigationOrder PlayerShip (Point (-40) 20)
+        , SetNavigationPostWaypointSpeed PlayerShip 0
+        ]
+        disabled
+    disabledSnapshot = combatSnapshotFromState caravelaDuelScenario attemptedNavigation
+  disabledPlayer <- expectShipSnapshot "disabled player navigation snapshot" PlayerShip disabledSnapshot
+  assertEqual "disabled ship clears an active navigation order" Nothing (shipNavigationOrder (combatPlayer attemptedNavigation))
+  assertEqual "disabled ship ignores new navigation intent" (shipTargetSpeed (combatPlayer ordered)) (shipTargetSpeed (combatPlayer attemptedNavigation))
+  assertEqual "disabled ship has no active navigation projection" Nothing (shipSnapshotActiveNavigationPlan disabledPlayer)
+
+testNavigationSafetyCapIsSurfaced :: IO ()
+testNavigationSafetyCapIsSurfaced = do
+  let
+    tickSeconds = 0.25
+    initialState =
+      caravelaDuel
+        { combatPlayer =
+            (combatPlayer caravelaDuel)
+              { shipCurrentSpeed = 4
+              , shipTargetSpeed = 4
+              }
+        }
+    ordered = tickCombatWith tickSeconds (const navigationMovement) [IssueNavigationOrder PlayerShip (Point 0 60)] initialState
+    noTurnMovement = navigationMovement {movementTurnRate = 0}
+  order <- expectNavigationOrder "navigation order before safety fallback" (combatPlayer ordered)
+  cappedPlan <- expectJust "active navigation plan after physics change" (planActiveNavigation tickSeconds noTurnMovement (combatPlayer ordered))
+  assertPoint "safety fallback keeps the committed waypoint" (navigationReachableWaypoint order) (navigationPlanReachableWaypoint cappedPlan)
+  assertEqual "safety fallback is surfaced instead of reclamping" True (navigationPlanReachedSafetyCap cappedPlan)
+
+testLocalApiExposesNavigationOrder :: IO ()
+testLocalApiExposesNavigationOrder = do
+  (api, _) <- startLocalDuel
+  let requestedWaypoint = Point 24 8
+  _ <- queueLocalCommand "queue local navigation order" api (IssueNavigationOrder PlayerShip requestedWaypoint)
+  snapshot <- advanceLocalApiTick "advance local navigation order" api
+  player <- expectShipSnapshot "navigation order snapshot" PlayerShip snapshot
+  order <- expectSnapshotNavigationOrder "snapshot exposes active navigation order" player
+  assertPoint "snapshot keeps requested waypoint" requestedWaypoint (navigationRequestedWaypoint order)
+  assertEqual "snapshot navigation order post-waypoint speed is non-negative" True (navigationPostWaypointSpeed order >= 0)
+
+testEnemyOrbitAutopilotIssuesNavigationOrders :: IO ()
+testEnemyOrbitAutopilotIssuesNavigationOrders = do
+  let
+    initialState = caravelaDuel
+    initialCenter = shipPosition (combatEnemy initialState)
+    firstOrdered = tickCombat [] initialState
+    firstEnemy = combatEnemy firstOrdered
+    firstAutopilot = combatEnemyOrbitAutopilot firstOrdered
+  firstOrder <- expectNavigationOrder "enemy autopilot issues a navigation order" firstEnemy
+  let
+    reachedFirstWaypoint =
+      firstOrdered
+        { combatEnemy =
+            firstEnemy
+              { shipPosition = navigationReachableWaypoint firstOrder
+              , shipHeading = Heading 0
+              , shipTargetHeading = Heading 0
+              , shipCurrentSpeed = 0
+              }
+        }
+    afterArrival = tickCombat [] reachedFirstWaypoint
+    nextAutopilot = combatEnemyOrbitAutopilot afterArrival
+  nextOrder <- expectNavigationOrder "enemy autopilot issues the next order after arrival" (combatEnemy afterArrival)
+  assertPoint "first orbit center is the enemy starting position" initialCenter (enemyOrbitCenter firstAutopilot)
+  assertApprox "first orbit waypoint uses the fixed radius" enemyOrbitRadius (pointDistance initialCenter (navigationRequestedWaypoint firstOrder))
+  assertEqual "first orbit order is an ordinary navigation order" (navigationRequestedWaypoint firstOrder) (navigationReachableWaypoint firstOrder)
+  assertEqual "orbit advances after issuing a successive waypoint" 2 (enemyOrbitNextWaypointIndex nextAutopilot)
+  assertApprox "next orbit waypoint keeps the fixed radius" enemyOrbitRadius (pointDistance initialCenter (navigationRequestedWaypoint nextOrder))
+
+navigationMovement :: MovementPhysics
+navigationMovement =
+  MovementPhysics
+    { movementBattleSpeed = 4
+    , movementMaxSpeed = 6
+    , movementAcceleration = 4
+    , movementDeceleration = 4
+    , movementTurnRate = 90
+    , movementIdealTurnSpeed = 4
+    , movementYawAcceleration = 180
+    }
+
+expectNavigationOrder :: String -> Ship -> IO NavigationOrder
+expectNavigationOrder label ship =
+  case shipNavigationOrder ship of
+    Just order -> pure order
+    Nothing -> die $ label <> ": expected an active navigation order"
+
+expectSnapshotNavigationOrder :: String -> ShipSnapshot -> IO NavigationOrder
+expectSnapshotNavigationOrder label ship =
+  case shipSnapshotNavigationOrder ship of
+    Just order -> pure order
+    Nothing -> die $ label <> ": expected an active navigation order in the snapshot"
+
+assertPlannerSamplesStartAtZero :: NavigationPlan -> IO ()
+assertPlannerSamplesStartAtZero plan =
+  case navigationPlanSamples plan of
+    firstSample : _ -> assertEqual "planner samples start at tick zero" 0 (trajectorySampleTickOffset firstSample)
+    [] -> die "planner returned no trajectory samples"
+
+assertSampleMatchesShip :: TrajectorySample -> Ship -> IO ()
+assertSampleMatchesShip sample ship = do
+  assertPoint "projection position matches simulation" (trajectorySamplePosition sample) (shipPosition ship)
+  assertApprox "projection heading matches simulation" (headingDegrees (trajectorySampleHeading sample)) (headingDegrees (shipHeading ship))
+  assertApprox "projection speed matches simulation" (trajectorySampleSpeed sample) (shipCurrentSpeed ship)
+  assertApprox "projection yaw rate matches simulation" (trajectorySampleYawRate sample) (shipCurrentYawRate ship)
+
+advanceUntilNavigationClears :: Int -> (CombatState -> CombatState) -> CombatState -> CombatState
+advanceUntilNavigationClears remaining advance state
+  | shipNavigationOrder (combatPlayer state) == Nothing = state
+  | remaining <= 0 = error "navigation order did not arrive before the test safety limit"
+  | otherwise = advanceUntilNavigationClears (remaining - 1) advance (advance state)
 
 testConfiguredBroadsideTuning :: IO ()
 testConfiguredBroadsideTuning = do
@@ -344,7 +766,7 @@ testConfiguredBroadsideTuning = do
     other -> die $ "configured big range: expected TargetOutOfRange, got " <> show other
   assertEqual "configured big damage" 49 (shipHull (combatEnemy bigFired))
   assertEqual "configured big reload" 4 (shipReload (combatPlayer bigFired))
-  assertApprox "configured heading intent does not replace physical heading for broadside" 6 (headingDegrees (shipHeading (combatPlayer bigFired)))
+  assertApprox "configured heading intent does not replace physical heading for broadside" 0 (headingDegrees (shipHeading (combatPlayer bigFired)))
   assertEqual "configured small range differs from big" BroadsideReady (canFireBroadsideWith (broadsideTuningForShip tunedConfig) smallAtLongRange PlayerShip EnemyShip Port)
   assertEqual "configured small damage" 147 (shipHull (combatEnemy smallFired))
   assertEqual "configured small reload" 1 (shipReload (combatPlayer smallFired))
@@ -386,12 +808,18 @@ testConfiguredMovementSnapshot = do
   localApi <- newConfiguredLocalCombatApi config
   let api = localCombatApi localApi
   _ <- expectRight "start configured scenario for movement snapshot" =<< combatApiStartScenario api caravelaDuelScenarioId
-  _ <- queueLocalCommand "queue configured heading" api (SetHeading PlayerShip (Heading 90))
+  _ <- queueLocalCommand "queue configured heading" api (SetHeading PlayerShip (Heading (-90)))
+  _ <- queueLocalCommand "queue configured target speed" api (SetTargetSpeed PlayerShip 2.5)
   snapshot <- advanceLocalApiTick "advance configured movement snapshot" api
   player <- expectShipSnapshot "configured movement snapshot player" PlayerShip snapshot
-  assertApprox "snapshot exposes physical heading" 6 (headingDegrees (shipSnapshotHeading player))
-  assertEqual "snapshot exposes target heading" (Heading 90) (shipSnapshotTargetHeading player)
+  secondSnapshot <- advanceLocalApiTick "advance configured movement snapshot again" api
+  secondPlayer <- expectShipSnapshot "configured movement snapshot player after yaw acceleration" PlayerShip secondSnapshot
+  assertApprox "snapshot exposes physical heading" 0 (headingDegrees (shipSnapshotHeading player))
+  assertEqual "snapshot exposes target heading" (Heading 270) (shipSnapshotTargetHeading player)
   assertApprox "snapshot exposes current speed" 1.6 (shipSnapshotCurrentSpeed player)
+  assertApprox "snapshot exposes continuous target speed" 2.5 (shipSnapshotTargetSpeed player)
+  assertApprox "snapshot exposes signed current yaw rate" 0 (shipSnapshotCurrentYawRate player)
+  assertApprox "snapshot exposes signed yaw rate after acceleration" (-8) (shipSnapshotCurrentYawRate secondPlayer)
 
 testConfiguredLocalApiHotReloadsLiveEngagement :: IO ()
 testConfiguredLocalApiHotReloadsLiveEngagement = do
@@ -459,6 +887,46 @@ testConfiguredLocalApiHotReloadsLiveEngagement = do
           }
       "small" -> boat {boatConfigMaxHull = 70}
       _ -> boat
+
+testHotReloadPreservesCommittedNavigationWaypoint :: IO ()
+testHotReloadPreservesCommittedNavigationWaypoint = do
+  config <- expectRight "load packaged config for navigation hot reload" =<< loadRuntimeCombatConfig
+  localApi <- newConfiguredLocalCombatApi config
+  let
+    api = localCombatApi localApi
+    reloadedConfig =
+      config
+        { combatConfigPhysics = PhysicsConfig 0.5
+        , combatConfigBoats = fmap tuneNavigationPhysics (combatConfigBoats config)
+        }
+  _ <- expectRight "start configured scenario before navigation hot reload" =<< combatApiStartScenario api caravelaDuelScenarioId
+  _ <- queueLocalCommand "queue navigation before hot reload" api (IssueNavigationOrder PlayerShip (Point 45 30))
+  beforeReload <- advanceLocalApiTick "advance navigation before hot reload" api
+  playerBefore <- expectShipSnapshot "player before navigation hot reload" PlayerShip beforeReload
+  orderBefore <- expectSnapshotNavigationOrder "order before navigation hot reload" playerBefore
+  planBefore <- expectSnapshotNavigationPlan "plan before navigation hot reload" playerBefore
+  localCombatApiReloadConfig localApi reloadedConfig
+  afterReload <- expectRight "observe navigation after hot reload" =<< combatApiObserveSnapshot api
+  playerAfter <- expectShipSnapshot "player after navigation hot reload" PlayerShip afterReload
+  orderAfter <- expectSnapshotNavigationOrder "order after navigation hot reload" playerAfter
+  planAfter <- expectSnapshotNavigationPlan "plan after navigation hot reload" playerAfter
+  assertPoint "hot reload does not move the committed waypoint" (navigationReachableWaypoint orderBefore) (navigationReachableWaypoint orderAfter)
+  assertPoint "hot reload reprojects to the original committed waypoint" (navigationReachableWaypoint orderBefore) (navigationPlanReachableWaypoint planAfter)
+  assertEqual "hot reload retains the requested waypoint metadata" (navigationRequestedWaypoint orderBefore) (navigationRequestedWaypoint orderAfter)
+  assertEqual "hot reload keeps the latest actual position" (shipSnapshotPosition playerBefore) (shipSnapshotPosition playerAfter)
+  assertApprox "hot reload exposes the updated tick duration to planning" 0.5 (combatSnapshotTickSeconds afterReload)
+  assertApprox "hot reload exposes updated turn physics to planning" 120 (movementTurnRate (shipSnapshotMovementPhysics playerAfter))
+  assertEqual "hot reload recomputes the projection with new physics" False (navigationPlanSamples planBefore == navigationPlanSamples planAfter)
+ where
+  tuneNavigationPhysics boat
+    | boatConfigId boat == "big" =
+        boat
+          { boatConfigMaxSpeed = 6
+          , boatConfigAcceleration = 5
+          , boatConfigTurnRate = 120
+          , boatConfigYawAcceleration = 80
+          }
+    | otherwise = boat
 
 testInvalidReloadKeepsLastValidConfigAndSnapshot :: IO ()
 testInvalidReloadKeepsLastValidConfigAndSnapshot = do
@@ -542,6 +1010,24 @@ testSetupOverlayState = do
   assertEqual "launch locks selected boat kinds into active engagement" selectedEngagement (setupActiveEngagement launchedState)
   assertEqual "selection cannot change while engagement is active" launchedState lockedState
 
+testSetupDebugOverlayState :: IO ()
+testSetupDebugOverlayState = do
+  let
+    engagement = EngagementSetup "big" "small"
+    initialState = initialSetupState engagement
+    openedState = applySetupAction ToggleSetupOverlay initialState
+    disabledState = applySetupAction (SetDebugOverlaysEnabled False) openedState
+    launchedState = applySetupAction LaunchEngagement disabledState
+    reopenedState = applySetupAction ToggleSetupOverlay launchedState
+    enabledState = applySetupAction (SetDebugOverlaysEnabled True) reopenedState
+    nextClientSession = initialSetupState engagement
+  assertEqual "debug overlays default on" True (setupDebugOverlaysEnabled initialState)
+  assertEqual "debug toggle applies while the engagement is active" False (setupDebugOverlaysEnabled disabledState)
+  assertEqual "debug toggle does not alter the selected engagement" engagement (setupSelectedEngagement disabledState)
+  assertEqual "debug toggle persists through launch in this client session" False (setupDebugOverlaysEnabled launchedState)
+  assertEqual "debug toggle can be changed immediately after reopening setup" True (setupDebugOverlaysEnabled enabledState)
+  assertEqual "new client setup state starts with the default debug flag" True (setupDebugOverlaysEnabled nextClientSession)
+
 testLocalApiQueuesCommandsUntilTick :: IO ()
 testLocalApiQueuesCommandsUntilTick = do
   (api, _) <- startLocalDuel
@@ -599,11 +1085,13 @@ testInitialBattleRenderScene = do
         combatSnapshotFromState caravelaDuelScenario caravelaDuel
     camera = renderSceneCamera renderScene
     meshes = renderSceneMeshes renderScene
+    primitives = renderScenePrimitives renderScene
   assertVec2 "render camera center" (vec2 0 40) (cameraCenter camera)
   assertApproxScalar "render camera viewport width" 160 (viewportWidth (cameraViewport camera))
   assertApproxScalar "render camera viewport height" 90 (viewportHeight (cameraViewport camera))
   assertApproxScalar "render camera zoom" 1 (cameraZoom camera)
   assertEqual "render mesh count" 6 (length meshes)
+  assertEqual "ship nodes flatten to render primitives" 6 (length primitives)
   assertMesh
     "initial player ship"
     "ship:player"
@@ -668,6 +1156,414 @@ testDamagedBattleRenderSceneTint = do
     "damaged enemy ship tint"
     (color 0.565 0.26 0.21 1)
     (materialColor (renderMeshMaterial enemyShip))
+
+testActiveNavigationRenderScene :: IO ()
+testActiveNavigationRenderScene = do
+  let
+    requestedWaypoint = Point 40 20
+    ordered = tickCombat [IssueNavigationOrder PlayerShip requestedWaypoint] caravelaDuel
+    advanced = tickCombat [] ordered
+    orderedSnapshot = combatSnapshotFromState caravelaDuelScenario ordered
+    advancedSnapshot = combatSnapshotFromState caravelaDuelScenario advanced
+    orderedScene = battleRenderSceneFromSnapshot orderedSnapshot
+    advancedScene = battleRenderSceneFromSnapshot advancedSnapshot
+  orderedPlayer <- expectShipSnapshot "active navigation render snapshot" PlayerShip orderedSnapshot
+  order <- expectSnapshotNavigationOrder "active navigation render order" orderedPlayer
+  plan <- expectSnapshotNavigationPlan "active navigation render plan" orderedPlayer
+  trajectory <- expectStrokePath "trajectory:player" orderedScene
+  maximumRing <- expectRingStroke "speed-ring:max:player" orderedScene
+  pendingRing <- expectRingStroke "speed-ring:pending:player" orderedScene
+  let
+    (trajectoryTransform, trajectoryPoints) = trajectory
+    (maximumRingTransform, maximumRingRadius) = maximumRing
+    (pendingRingTransform, pendingRingRadius) = pendingRing
+  assertEqual "active trajectory uses selected planner samples" (fmap (pointPosition . trajectorySamplePosition) (navigationPlanSamples plan)) trajectoryPoints
+  assertVec3 "active trajectory sits above water" (vec3 0 0 0.1) (transformPosition trajectoryTransform)
+  assertVec3 "maximum speed ring stays at committed waypoint" (waypointPosition order) (transformPosition maximumRingTransform)
+  assertVec3 "pending speed ring stays at committed waypoint" (waypointPosition order) (transformPosition pendingRingTransform)
+  assertApproxScalar "maximum speed ring has fixed radius" 8 maximumRingRadius
+  assertApproxScalar
+    "pending speed ring scales to maximum speed"
+    (8 * realToFrac (navigationPostWaypointSpeed order / shipSnapshotMaxSpeed orderedPlayer))
+    pendingRingRadius
+  advancedPlayer <- expectShipSnapshot "advanced active navigation render snapshot" PlayerShip advancedSnapshot
+  advancedOrder <- expectSnapshotNavigationOrder "advanced active navigation render order" advancedPlayer
+  advancedPlan <- expectSnapshotNavigationPlan "advanced active navigation render plan" advancedPlayer
+  advancedTrajectory <- expectStrokePath "trajectory:player" advancedScene
+  (advancedRingTransform, _) <- expectRingStroke "speed-ring:max:player" advancedScene
+  firstAdvancedSample <- expectFirstTrajectorySample "advanced active navigation render plan" advancedPlan
+  assertPoint "remaining trajectory starts at latest actual position" (shipSnapshotPosition advancedPlayer) (trajectorySamplePosition firstAdvancedSample)
+  assertEqual "remaining trajectory does not keep prior path history" False (snd trajectory == snd advancedTrajectory)
+  assertVec3 "speed ring remains visible at its committed waypoint" (waypointPosition advancedOrder) (transformPosition advancedRingTransform)
+
+testEnemyDebugNavigationRenderScene :: IO ()
+testEnemyDebugNavigationRenderScene = do
+  let
+    snapshot = combatSnapshotFromState caravelaDuelScenario (tickCombat [] caravelaDuel)
+    debugScene =
+      battleRenderScene $
+        battleSceneFromSnapshotWithNavigationGestureAndDebug False True Nothing NoNavigationGesture snapshot
+    normalScene =
+      battleRenderScene $
+        battleSceneFromSnapshotWithNavigationGestureAndDebug False False Nothing NoNavigationGesture snapshot
+  enemy <- expectShipSnapshot "enemy debug render snapshot" EnemyShip snapshot
+  order <- expectSnapshotNavigationOrder "enemy debug navigation order" enemy
+  plan <- expectSnapshotNavigationPlan "enemy debug navigation plan" enemy
+  (trajectoryTransform, trajectoryPoints) <- expectStrokePath "trajectory:enemy" debugScene
+  (maximumRingTransform, _) <- expectRingStroke "speed-ring:max:enemy" debugScene
+  (pendingRingTransform, _) <- expectRingStroke "speed-ring:pending:enemy" debugScene
+  assertEqual "enemy debug trajectory uses the active navigation plan" (fmap (pointPosition . trajectorySamplePosition) (navigationPlanSamples plan)) trajectoryPoints
+  assertVec3 "enemy debug trajectory sits above water" (vec3 0 0 0.1) (transformPosition trajectoryTransform)
+  assertVec3 "enemy debug maximum speed ring stays at the waypoint" (waypointPosition order) (transformPosition maximumRingTransform)
+  assertVec3 "enemy debug pending speed ring stays at the waypoint" (waypointPosition order) (transformPosition pendingRingTransform)
+  assertEqual "enemy debug overlays are omitted when disabled" [] (enemyNavigationNodes normalScene)
+
+testBattleInputHoverIntent :: IO ()
+testBattleInputHoverIntent = do
+  let
+    centerPointer =
+      PointerMoved
+        (ScreenPoint 380 214)
+        (ScreenSize 760 428)
+    hoverIntent = hoverIntentFromRawPointer battleCamera centerPointer
+  assertEqual "canvas center becomes navigation hover intent" (PreviewNavigation (Point 0 40)) hoverIntent
+  assertEqual
+    "pointer movement updates hover state"
+    (Just (Point 0 40))
+    (applyNavigationHoverIntent Nothing hoverIntent)
+  assertEqual
+    "leaving battle view clears hover state"
+    Nothing
+    (applyNavigationHoverIntent (Just (Point 0 40)) (hoverIntentFromRawPointer battleCamera PointerLeftBattleView))
+  assertEqual
+    "other controls clear hover state"
+    Nothing
+    (applyNavigationHoverIntent (Just (Point 0 40)) (hoverIntentFromRawPointer battleCamera PointerMovedOverControl))
+
+testBattleInputMouseNavigationGesture :: IO ()
+testBattleInputMouseNavigationGesture = do
+  tightPlan <-
+    expectJust
+      "tight mouse-down has a navigation plan"
+      ( planNavigationForSnapshot
+          (combatSnapshotFromState caravelaDuelScenario caravelaDuel)
+          PlayerShip
+          (Point 0.5 0)
+      )
+  let
+    centerPointer =
+      ScreenPoint 380 214
+    canvasSize = ScreenSize 760 428
+    mouseDownIntent =
+      navigationPointerIntentFromRawPointer
+        battleCamera
+        (RawPrimaryPointerDown centerPointer canvasSize)
+    reachableWaypoint = navigationPlanReachableWaypoint tightPlan
+    gesture = beginNavigationGesture reachableWaypoint 6
+    eastDrag = updateNavigationGesture (offsetPoint reachableWaypoint 4 0) gesture
+    northDrag = updateNavigationGesture (offsetPoint reachableWaypoint 0 4) gesture
+    stoppedDrag = updateNavigationGesture reachableWaypoint gesture
+    maximumDrag = updateNavigationGesture (offsetPoint reachableWaypoint 20 0) gesture
+    dragScene =
+      battleRenderScene $
+        battleSceneFromSnapshotWithNavigationGesture
+          False
+          Nothing
+          eastDrag
+          (combatSnapshotFromState caravelaDuelScenario caravelaDuel)
+  assertEqual
+    "primary mouse down becomes a semantic navigation intent"
+    (NavigationPointerPrimaryDown (Point 0 40))
+    mouseDownIntent
+  assertEqual "tight gesture plan is clamped" True (navigationPlanWasClamped tightPlan)
+  assertEqual "drag gesture centers on the reachable waypoint" False (reachableWaypoint == Point 0.5 0)
+  assertEqual "plain click leaves post-waypoint speed inherited" Nothing (navigationGestureSelectedSpeed gesture)
+  assertApprox "drag distance selects a proportional speed" 3 =<< expectJust "east drag selects speed" (navigationGestureSelectedSpeed eastDrag)
+  assertApprox "drag direction has no gameplay meaning" 3 =<< expectJust "north drag selects speed" (navigationGestureSelectedSpeed northDrag)
+  assertApprox "dragging from waypoint center selects stopped speed" 0 =<< expectJust "center drag selects speed" (navigationGestureSelectedSpeed stoppedDrag)
+  assertApprox "dragging past the speed ring selects maximum speed" 6 =<< expectJust "outer drag selects speed" (navigationGestureSelectedSpeed maximumDrag)
+  (dragRingTransform, dragRingRadius) <- expectRingStroke "drag-speed-ring:player" dragScene
+  assertVec3
+    "drag speed ring stays at the reachable waypoint"
+    (vec3 (realToFrac (pointX reachableWaypoint)) (realToFrac (pointY reachableWaypoint)) 0.2)
+    (transformPosition dragRingTransform)
+  assertApproxScalar "drag speed ring previews the selected speed" 4 dragRingRadius
+
+testHoverNavigationRenderScene :: IO ()
+testHoverNavigationRenderScene = do
+  let
+    ordered = tickCombat [IssueNavigationOrder PlayerShip (Point 40 20)] caravelaDuel
+    requestedWaypoint = shipPosition (combatPlayer ordered)
+    snapshot = combatSnapshotFromState caravelaDuelScenario ordered
+    scene = battleSceneFromSnapshotWithHover False (Just requestedWaypoint) snapshot
+    renderScene = battleRenderScene scene
+  expectedPlan <- expectHoverNavigationPlan "hover navigation plan" scene
+  snapshotPlan <- expectJust "snapshot hover navigation plan" (planNavigationForSnapshot snapshot PlayerShip requestedWaypoint)
+  player <- expectShipSnapshot "hover navigation player" PlayerShip snapshot
+  activeTrajectory <- expectStrokePath "trajectory:player" renderScene
+  hoverTrajectory <- expectStrokePath "hover-trajectory:player" renderScene
+  (maximumRingTransform, maximumRingRadius) <- expectRingStroke "hover-speed-ring:max:player" renderScene
+  (arrivalRingTransform, arrivalRingRadius) <- expectRingStroke "hover-speed-ring:arrival:player" renderScene
+  assertEqual "hover uses the snapshot planner result" snapshotPlan expectedPlan
+  assertEqual "hover clamps a tight cursor waypoint" True (navigationPlanWasClamped expectedPlan)
+  assertEqual "active trajectory remains beside hover preview" False (snd activeTrajectory == snd hoverTrajectory)
+  assertEqual "hover trajectory uses selected planner samples" (fmap (pointPosition . trajectorySamplePosition) (navigationPlanSamples expectedPlan)) (snd hoverTrajectory)
+  assertVec3 "hover maximum speed ring sits at reachable waypoint" (hoverWaypointPosition expectedPlan) (transformPosition maximumRingTransform)
+  assertVec3 "hover arrival speed ring sits at reachable waypoint" (hoverWaypointPosition expectedPlan) (transformPosition arrivalRingTransform)
+  assertApproxScalar "hover maximum speed ring has fixed radius" 8 maximumRingRadius
+  assertApproxScalar
+    "hover arrival ring shows expected arrival speed"
+    (8 * realToFrac (navigationPlanArrivalSpeed expectedPlan / shipSnapshotMaxSpeed player))
+    arrivalRingRadius
+
+testHoverNavigationIsHiddenOutsideActiveBattleView :: IO ()
+testHoverNavigationIsHiddenOutsideActiveBattleView = do
+  let
+    requestedWaypoint = Point 30 20
+    runningSnapshot = combatSnapshotFromState caravelaDuelScenario caravelaDuel
+    finishedSnapshot =
+      combatSnapshotFromState
+        caravelaDuelScenario
+        (caravelaDuel {combatStatus = ScenarioFinished (Winner PlayerShip)})
+    setupScene = battleRenderScene (battleSceneFromSnapshotWithHover True (Just requestedWaypoint) runningSnapshot)
+    finishedScene = battleRenderScene (battleSceneFromSnapshotWithHover False (Just requestedWaypoint) finishedSnapshot)
+  assertEqual "setup overlay hides hover preview" [] (hoverPlanningNodes setupScene)
+  assertEqual "finished scenario hides hover preview" [] (hoverPlanningNodes finishedScene)
+
+testSetupOverlayBlocksNavigation :: IO ()
+testSetupOverlayBlocksNavigation = do
+  let
+    snapshot =
+      combatSnapshotFromState
+        caravelaDuelScenario
+        (tickCombat [IssueNavigationOrder PlayerShip (Point 40 20)] caravelaDuel)
+    gesture = NavigationGesture (Point 40 20) 4 (Just 2)
+    setupScene = battleRenderScene (battleSceneFromSnapshotWithNavigationGesture True (Just (Point 30 20)) gesture snapshot)
+  assertEqual "setup overlay rejects navigation input" False (navigationInputAllowed True ScenarioRunning)
+  assertEqual "setup overlay hides active, hover, and drag planning overlays" [] (filter isPlanningNode (renderSceneNodes setupScene))
+
+testFinishedScenarioBlocksNavigation :: IO ()
+testFinishedScenarioBlocksNavigation = do
+  let
+    finishedState =
+      (tickCombat [IssueNavigationOrder PlayerShip (Point 40 20)] caravelaDuel)
+        { combatStatus = ScenarioFinished (Winner PlayerShip)
+        }
+    finishedSnapshot = combatSnapshotFromState caravelaDuelScenario finishedState
+    gesture = NavigationGesture (Point 40 20) 4 (Just 2)
+    finishedScene = battleRenderScene (battleSceneFromSnapshotWithNavigationGesture False (Just (Point 30 20)) gesture finishedSnapshot)
+  assertEqual "finished scenario rejects navigation input" False (navigationInputAllowed False (combatSnapshotStatus finishedSnapshot))
+  assertEqual "finished scenario rejects navigation planning" Nothing (planNavigationForSnapshot finishedSnapshot PlayerShip (Point 30 20))
+  assertEqual "finished scenario hides active, hover, and drag planning overlays" [] (filter isPlanningNode (renderSceneNodes finishedScene))
+
+testFinishedBattleRenderSceneHidesPlanning :: IO ()
+testFinishedBattleRenderSceneHidesPlanning = do
+  let
+    ordered = tickCombat [IssueNavigationOrder PlayerShip (Point 40 20)] caravelaDuel
+    finished = ordered {combatStatus = ScenarioFinished (Winner PlayerShip)}
+    renderScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario finished)
+    planningNodes = filter isPlanningNode (renderSceneNodes renderScene)
+  assertEqual "finished scenarios hide active planning overlays" [] planningNodes
+
+testSceneGraphTraversal :: IO ()
+testSceneGraphTraversal = do
+  let
+    scene =
+      RenderScene
+        { renderSceneCamera = camera2D (viewport 160 90)
+        , renderSceneNodes =
+            [ RenderGroup
+                "fleet"
+                (transform (vec3 10 20 0.5) (pi / 2) (vec3 1 1 1))
+                [ RenderMeshNode
+                    RenderMesh
+                      { renderMeshName = "ship"
+                      , renderMeshGeometry = UnitCubeGeometry
+                      , renderMeshMaterial = basicMaterial (color 1 1 1 1)
+                      , renderMeshTransform = transform (vec3 2 0 0) 0 (vec3 1 1 1)
+                      }
+                ]
+            ]
+        }
+  primitive <- expectRenderPrimitive "ship" scene
+  assertEqual "scene graph keeps mesh nodes" 1 (length (renderSceneMeshes scene))
+  assertVec3
+    "scene graph composes parent transform"
+    (vec3 10 22 0.5)
+    (transformPoint3 (renderPrimitiveWorldMatrix primitive) (vec3 0 0 0))
+  assertApproxScalar
+    "quaternion-backed helper rotation remains readable"
+    (pi / 2)
+    (transformRotationZ (transform (vec3 0 0 0) (pi / 2) (vec3 1 1 1)))
+  assertEqual
+    "mesh primitive uses cube geometry"
+    (length (geometry3DIndices unitCubeGeometry))
+    (length (geometry3DIndices (renderPrimitiveGeometry primitive)))
+
+testStrokePathRenderPrimitive :: IO ()
+testStrokePathRenderPrimitive = do
+  let
+    scene =
+      RenderScene
+        { renderSceneCamera = camera2D (viewport 160 90)
+        , renderSceneNodes =
+            [ StrokePath
+                "trajectory"
+                (transform (vec3 0 0 0.1) 0 (vec3 1 1 1))
+                [vec3 0 0 0, vec3 10 0 0]
+                (strokeStyle 2 (color 0.3 0.8 1 1))
+            ]
+        }
+  primitive <- expectRenderPrimitive "trajectory" scene
+  let geometry = renderPrimitiveGeometry primitive
+  firstVertex <- expectFirstVertex "stroke path" geometry
+  assertEqual "stroke path expands to four vertices" 4 (length (geometry3DVertices geometry))
+  assertEqual "stroke path expands to two triangles" 6 (length (geometry3DIndices geometry))
+  assertVec3
+    "stroke transform lifts flat geometry above water"
+    (vec3 0 1 0.1)
+    (transformPoint3 (renderPrimitiveWorldMatrix primitive) firstVertex)
+
+testRingStrokeRenderPrimitive :: IO ()
+testRingStrokeRenderPrimitive = do
+  let
+    scene =
+      RenderScene
+        { renderSceneCamera = camera2D (viewport 160 90)
+        , renderSceneNodes =
+            [ RingStroke
+                "speed-ring"
+                (transform (vec3 5 7 0.2) 0 (vec3 1 1 1))
+                (vec3 0 0 0)
+                12
+                8
+                (strokeStyle 1 (color 0.9 0.8 0.3 1))
+            ]
+        }
+  primitive <- expectRenderPrimitive "speed-ring" scene
+  let geometry = renderPrimitiveGeometry primitive
+  firstVertex <- expectFirstVertex "ring stroke" geometry
+  assertEqual "ring stroke expands each segment to a quad" 32 (length (geometry3DVertices geometry))
+  assertEqual "ring stroke expands each segment to two triangles" 48 (length (geometry3DIndices geometry))
+  assertApproxScalar
+    "ring geometry stays flat before its transform"
+    0
+    (vec3Z firstVertex)
+  assertApproxScalar
+    "ring transform lifts geometry above water"
+    0.2
+    (vec3Z (transformPoint3 (renderPrimitiveWorldMatrix primitive) firstVertex))
+
+expectRenderPrimitive :: Text -> RenderScene -> IO RenderPrimitive
+expectRenderPrimitive name scene =
+  case filter ((== name) . renderPrimitiveName) (renderScenePrimitives scene) of
+    [primitive] -> pure primitive
+    [] -> die $ "missing render primitive " <> show name
+    primitives -> die $ "expected one render primitive " <> show name <> ", got " <> show (length primitives)
+
+expectStrokePath :: Text -> RenderScene -> IO (Transform, [Vec3])
+expectStrokePath name scene =
+  case matchingNodes of
+    [(localTransform, points)] -> pure (localTransform, points)
+    [] -> die $ "missing stroke path " <> show name
+    nodes -> die $ "expected one stroke path " <> show name <> ", got " <> show (length nodes)
+ where
+  matchingNodes =
+    [ (localTransform, points)
+    | StrokePath nodeName localTransform points _ <- renderSceneNodes scene
+    , nodeName == name
+    ]
+
+expectRingStroke :: Text -> RenderScene -> IO (Transform, Scalar)
+expectRingStroke name scene =
+  case matchingNodes of
+    [(localTransform, radius)] -> pure (localTransform, radius)
+    [] -> die $ "missing ring stroke " <> show name
+    nodes -> die $ "expected one ring stroke " <> show name <> ", got " <> show (length nodes)
+ where
+  matchingNodes =
+    [ (localTransform, radius)
+    | RingStroke nodeName localTransform _ radius _ _ <- renderSceneNodes scene
+    , nodeName == name
+    ]
+
+expectSnapshotNavigationPlan :: String -> ShipSnapshot -> IO NavigationPlan
+expectSnapshotNavigationPlan label ship =
+  case shipSnapshotActiveNavigationPlan ship of
+    Just plan -> pure plan
+    Nothing -> die $ label <> ": expected an active navigation plan in the snapshot"
+
+expectHoverNavigationPlan :: String -> BattleScene -> IO NavigationPlan
+expectHoverNavigationPlan label scene =
+  case battleSceneHoverNavigationPlan scene of
+    Just plan -> pure plan
+    Nothing -> die $ label <> ": expected a hover navigation plan"
+
+expectFirstTrajectorySample :: String -> NavigationPlan -> IO TrajectorySample
+expectFirstTrajectorySample label plan =
+  case navigationPlanSamples plan of
+    sample : _ -> pure sample
+    [] -> die $ label <> ": expected at least one trajectory sample"
+
+pointPosition :: Point -> Vec3
+pointPosition point =
+  vec3 (realToFrac (pointX point)) (realToFrac (pointY point)) 0
+
+offsetPoint :: Point -> Double -> Double -> Point
+offsetPoint point offsetX offsetY =
+  Point
+    { pointX = pointX point + offsetX
+    , pointY = pointY point + offsetY
+    }
+
+pointDistance :: Point -> Point -> Double
+pointDistance from to =
+  sqrt (((pointX to - pointX from) ** 2) + ((pointY to - pointY from) ** 2))
+
+waypointPosition :: NavigationOrder -> Vec3
+waypointPosition order =
+  let waypoint = navigationReachableWaypoint order
+   in vec3 (realToFrac (pointX waypoint)) (realToFrac (pointY waypoint)) 0.1
+
+hoverWaypointPosition :: NavigationPlan -> Vec3
+hoverWaypointPosition plan =
+  let waypoint = navigationPlanReachableWaypoint plan
+   in vec3 (realToFrac (pointX waypoint)) (realToFrac (pointY waypoint)) 0.15
+
+isPlanningNode :: RenderNode -> Bool
+isPlanningNode node =
+  case node of
+    StrokePath _ _ _ _ -> True
+    RingStroke _ _ _ _ _ _ -> True
+    _ -> False
+
+enemyNavigationNodes :: RenderScene -> [RenderNode]
+enemyNavigationNodes scene =
+  filter isEnemyNavigationNode (renderSceneNodes scene)
+
+isEnemyNavigationNode :: RenderNode -> Bool
+isEnemyNavigationNode node =
+  case node of
+    StrokePath name _ _ _ -> ":enemy" `Text.isSuffixOf` name
+    RingStroke name _ _ _ _ _ -> ":enemy" `Text.isSuffixOf` name
+    _ -> False
+
+hoverPlanningNodes :: RenderScene -> [RenderNode]
+hoverPlanningNodes scene =
+  filter isHoverPlanningNode (renderSceneNodes scene)
+
+isHoverPlanningNode :: RenderNode -> Bool
+isHoverPlanningNode node =
+  case node of
+    StrokePath name _ _ _ -> "hover-trajectory" `Text.isPrefixOf` name
+    RingStroke name _ _ _ _ _ -> "hover-speed-ring" `Text.isPrefixOf` name
+    _ -> False
+
+expectFirstVertex :: String -> Geometry3D -> IO Vec3
+expectFirstVertex label geometry =
+  case geometry3DVertices geometry of
+    vertex : _ -> pure vertex
+    [] -> die $ label <> ": expected generated geometry to contain a vertex"
 
 expectMesh :: Text -> RenderScene -> IO RenderMesh
 expectMesh name renderScene =
