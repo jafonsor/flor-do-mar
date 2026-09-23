@@ -18,7 +18,9 @@ Movement tests and browser-driving traps that produce false signals. See `docs/a
 
 ### Git
 
-Use `./scripts/git` for every git call, so the version in play is the nix-built one the dev shell supplies. A "tool not found" usually means the shell predates the current flake — see `docs/agents/git-workflow.md` before committing, switching branches, or rewriting history.
+Use `./scripts/git` for every git call, so the version in play is the nix-built one the dev shell supplies. See `docs/agents/git-workflow.md` before committing, switching branches, or rewriting history.
+
+After changing `flake.nix`, warn that the dev shell must be restarted — re-enter the project directory so direnv applies the flake, then restart `dshweb`. A running session keeps the environment it started with, so the new tooling is not available until then. Do not try to apply the flake from inside a tool call.
 
 ### Recording lessons
 
