@@ -23,6 +23,8 @@ data SetupState = SetupState
   { setupOverlayOpen :: Bool
   , setupSelectedEngagement :: EngagementSetup
   , setupActiveEngagement :: EngagementSetup
+  -- | Client-session state. It deliberately has no persistence boundary.
+  , setupDebugOverlaysEnabled :: Bool
   }
   deriving stock (Eq, Show)
 
@@ -30,6 +32,7 @@ data SetupAction
   = ToggleSetupOverlay
   | SelectPlayerBoatKind Text
   | SelectEnemyBoatKind Text
+  | SetDebugOverlaysEnabled Bool
   | LaunchEngagement
   deriving stock (Eq, Show)
 
@@ -39,6 +42,7 @@ initialSetupState engagement =
     { setupOverlayOpen = False
     , setupSelectedEngagement = engagement
     , setupActiveEngagement = engagement
+    , setupDebugOverlaysEnabled = True
     }
 
 applySetupAction :: SetupAction -> SetupState -> SetupState
@@ -61,6 +65,8 @@ applySetupAction action state =
                   { engagementSetupEnemyBoatKind = boatKind
                   }
             }
+    SetDebugOverlaysEnabled enabled
+      | setupOverlayOpen state -> state {setupDebugOverlaysEnabled = enabled}
     LaunchEngagement
       | setupOverlayOpen state ->
           state

@@ -14,6 +14,8 @@ module FlorDoMar.Combat.Api
   , caravelaDuelScenarioId
   , combatSnapshotFromState
   , combatSnapshotFromStateWith
+  , combatSnapshotFromStateWithPlanning
+  , planNavigationForSnapshot
   )
 where
 
@@ -48,6 +50,7 @@ data CombatApiError
 data CombatSnapshot = CombatSnapshot
   { combatSnapshotScenario :: ScenarioSummary
   , combatSnapshotTick :: Int
+  , combatSnapshotTickSeconds :: Double
   , combatSnapshotWind :: WindSnapshot
   , combatSnapshotShips :: [ShipSnapshot]
   , combatSnapshotEngagement :: EngagementSnapshot
@@ -71,6 +74,12 @@ data ShipSnapshot = ShipSnapshot
   , shipSnapshotTargetHeading :: Heading
   , shipSnapshotSails :: SailState
   , shipSnapshotCurrentSpeed :: Double
+  , shipSnapshotTargetSpeed :: Double
+  , shipSnapshotCurrentYawRate :: Double
+  , shipSnapshotNavigationOrder :: Maybe NavigationOrder
+  , shipSnapshotActiveNavigationPlan :: Maybe NavigationPlan
+  , shipSnapshotMovementPhysics :: MovementPhysics
+  , shipSnapshotMaxSpeed :: Double
   , shipSnapshotMaxHull :: Int
   , shipSnapshotHull :: Int
   , shipSnapshotRenderedLength :: Double
@@ -100,14 +109,19 @@ combatSnapshotFromState :: ScenarioSummary -> CombatState -> CombatSnapshot
 combatSnapshotFromState = combatSnapshotFromStateWith (const legacyBroadsideTuning)
 
 combatSnapshotFromStateWith :: (Ship -> BroadsideTuning) -> ScenarioSummary -> CombatState -> CombatSnapshot
-combatSnapshotFromStateWith broadsideTuningForShip scenario state =
+combatSnapshotFromStateWith =
+  combatSnapshotFromStateWithPlanning 1 (const legacyMovementPhysics)
+
+combatSnapshotFromStateWithPlanning :: Double -> (Ship -> MovementPhysics) -> (Ship -> BroadsideTuning) -> ScenarioSummary -> CombatState -> CombatSnapshot
+combatSnapshotFromStateWithPlanning tickSeconds movementForShip broadsideTuningForShip scenario state =
   CombatSnapshot
     { combatSnapshotScenario = scenario
     , combatSnapshotTick = combatTick state
+    , combatSnapshotTickSeconds = tickSeconds
     , combatSnapshotWind = windSnapshot (combatWind state)
     , combatSnapshotShips =
-        [ shipSnapshot (combatPlayer state)
-        , shipSnapshot (combatEnemy state)
+        [ shipSnapshot tickSeconds movementForShip (combatPlayer state)
+        , shipSnapshot tickSeconds movementForShip (combatEnemy state)
         ]
     , combatSnapshotEngagement =
         EngagementSnapshot
@@ -125,8 +139,8 @@ windSnapshot wind =
     , windSnapshotSpeed = windSpeed wind
     }
 
-shipSnapshot :: Ship -> ShipSnapshot
-shipSnapshot ship =
+shipSnapshot :: Double -> (Ship -> MovementPhysics) -> Ship -> ShipSnapshot
+shipSnapshot tickSeconds movementForShip ship =
   ShipSnapshot
     { shipSnapshotId = shipId ship
     , shipSnapshotBoatKind = shipBoatKind ship
@@ -137,11 +151,66 @@ shipSnapshot ship =
     , shipSnapshotTargetHeading = shipTargetHeading ship
     , shipSnapshotSails = shipSails ship
     , shipSnapshotCurrentSpeed = shipCurrentSpeed ship
+    , shipSnapshotTargetSpeed = shipTargetSpeed ship
+    , shipSnapshotCurrentYawRate = shipCurrentYawRate ship
+    , shipSnapshotNavigationOrder = shipNavigationOrder ship
+    , shipSnapshotActiveNavigationPlan = planActiveNavigation tickSeconds movement ship
+    , shipSnapshotMovementPhysics = movement
+    , shipSnapshotMaxSpeed = movementMaxSpeed movement
     , shipSnapshotMaxHull = shipMaxHull ship
     , shipSnapshotHull = shipHull ship
     , shipSnapshotRenderedLength = shipRenderedLength ship
     , shipSnapshotRenderedWidth = shipRenderedWidth ship
     , shipSnapshotReload = shipReload ship
+    }
+ where
+  movement = movementForShip ship
+
+-- | Preview planning starts from the snapshot's actual ship state, using the
+-- same domain planner and result shape as an active navigation order.
+planNavigationForSnapshot :: CombatSnapshot -> ShipId -> Point -> Maybe NavigationPlan
+planNavigationForSnapshot snapshot identity requestedWaypoint = do
+  ship <- findSnapshotShip identity snapshot
+  if combatSnapshotStatus snapshot /= ScenarioRunning || shipSnapshotHull ship <= 0
+    then Nothing
+    else
+      pure $
+        planNavigation
+          (combatSnapshotTickSeconds snapshot)
+          (shipSnapshotMovementPhysics ship)
+          (shipFromSnapshot ship)
+          requestedWaypoint
+
+findSnapshotShip :: ShipId -> CombatSnapshot -> Maybe ShipSnapshot
+findSnapshotShip identity = go . combatSnapshotShips
+ where
+  go snapshots =
+    case snapshots of
+      ship : remaining
+        | shipSnapshotId ship == identity -> Just ship
+        | otherwise -> go remaining
+      [] -> Nothing
+
+shipFromSnapshot :: ShipSnapshot -> Ship
+shipFromSnapshot snapshot =
+  Ship
+    { shipId = shipSnapshotId snapshot
+    , shipBoatKind = shipSnapshotBoatKind snapshot
+    , shipDisplayName = shipSnapshotDisplayName snapshot
+    , shipPosition = shipSnapshotPosition snapshot
+    , shipHeading = shipSnapshotHeading snapshot
+    , shipTargetHeading = shipSnapshotTargetHeading snapshot
+    , shipSails = shipSnapshotSails snapshot
+    , shipCurrentSpeed = shipSnapshotCurrentSpeed snapshot
+    , shipTargetSpeed = shipSnapshotTargetSpeed snapshot
+    , shipCurrentYawRate = shipSnapshotCurrentYawRate snapshot
+    , shipNavigationOrder = shipSnapshotNavigationOrder snapshot
+    , shipMaxHull = shipSnapshotMaxHull snapshot
+    , shipDamageTaken = shipSnapshotMaxHull snapshot - shipSnapshotHull snapshot
+    , shipHull = shipSnapshotHull snapshot
+    , shipRenderedLength = shipSnapshotRenderedLength snapshot
+    , shipRenderedWidth = shipSnapshotRenderedWidth snapshot
+    , shipReload = shipSnapshotReload snapshot
     }
 
 pointDistance :: Point -> Point -> Double

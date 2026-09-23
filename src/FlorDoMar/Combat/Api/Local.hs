@@ -204,7 +204,9 @@ activeScenarioSnapshot maybeConfig activeScenario =
   case maybeConfig of
     Nothing -> combatSnapshotFromState (activeScenarioSummary activeScenario) (activeCombatState activeScenario)
     Just config ->
-      combatSnapshotFromStateWith
+      combatSnapshotFromStateWithPlanning
+        (combatConfigTickSeconds config)
+        (movementPhysicsForShip config)
         (broadsideTuningForShip config)
         (activeScenarioSummary activeScenario)
         (activeCombatState activeScenario)

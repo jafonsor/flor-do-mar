@@ -14,6 +14,7 @@ module FlorDoMar.Combat.Config
   , findBoatConfig
   , loadCombatConfig
   , loadRuntimeCombatConfig
+  , movementPhysicsForShip
   , renderConfigDiagnostic
   , runtimeCombatConfigDirectory
   , tickConfiguredCombat
@@ -49,7 +50,8 @@ data BoatConfig = BoatConfig
   , boatConfigAcceleration :: Double
   , boatConfigDeceleration :: Double
   , boatConfigTurnRate :: Double
-  , boatConfigMinimumTurnSpeedFactor :: Double
+  , boatConfigIdealTurnSpeed :: Double
+  , boatConfigYawAcceleration :: Double
   , boatConfigBroadsideRange :: Double
   , boatConfigBroadsideDamage :: Int
   , boatConfigReloadTicks :: Int
@@ -137,6 +139,7 @@ configuredEngagement config playerBoatKind enemyBoatKind = do
     , combatWind = Wind {windDirection = Heading 0, windSpeed = 0}
     , combatPlayer = shipFromConfig PlayerShip (Point 0 0) (Heading 0) playerBoat
     , combatEnemy = shipFromConfig EnemyShip (Point 0 80) (Heading 180) enemyBoat
+    , combatEnemyOrbitAutopilot = EnemyOrbitAutopilot (Point 0 80) 0
     , combatStatus = ScenarioRunning
     }
 
@@ -153,13 +156,16 @@ applyConfigToShip config ship =
   case findBoatConfig (shipBoatKind ship) config of
     Nothing -> ship
     Just boat ->
-      ship
-        { shipDisplayName = boatConfigDisplayName boat
-        , shipMaxHull = boatConfigMaxHull boat
-        , shipHull = max 0 (boatConfigMaxHull boat - shipDamageTaken ship)
-        , shipRenderedLength = boatConfigRenderedLength boat
-        , shipRenderedWidth = boatConfigRenderedWidth boat
-        }
+      let refreshedHull = max 0 (boatConfigMaxHull boat - shipDamageTaken ship)
+       in ship
+            { shipDisplayName = boatConfigDisplayName boat
+            , shipMaxHull = boatConfigMaxHull boat
+            , shipHull = refreshedHull
+            , shipRenderedLength = boatConfigRenderedLength boat
+            , shipRenderedWidth = boatConfigRenderedWidth boat
+            , shipTargetSpeed = max 0 (min (boatConfigMaxSpeed boat) (shipTargetSpeed ship))
+            , shipNavigationOrder = if refreshedHull <= 0 then Nothing else shipNavigationOrder ship
+            }
 combatConfigTickSeconds :: CombatConfig -> Double
 combatConfigTickSeconds = physicsTickSeconds . combatConfigPhysics
 
@@ -180,7 +186,8 @@ movementPhysicsForShip config ship =
         , movementAcceleration = boatConfigAcceleration boat
         , movementDeceleration = boatConfigDeceleration boat
         , movementTurnRate = boatConfigTurnRate boat
-        , movementMinimumTurnSpeedFactor = boatConfigMinimumTurnSpeedFactor boat
+        , movementIdealTurnSpeed = boatConfigIdealTurnSpeed boat
+        , movementYawAcceleration = boatConfigYawAcceleration boat
         }
     Nothing -> error "combat state references a boat kind absent from its config"
 
@@ -210,6 +217,9 @@ shipFromConfig identity position heading boat =
     , shipTargetHeading = heading
     , shipSails = BattleSails
     , shipCurrentSpeed = 0
+    , shipTargetSpeed = boatConfigBattleSpeed boat
+    , shipCurrentYawRate = 0
+    , shipNavigationOrder = Nothing
     , shipMaxHull = boatConfigMaxHull boat
     , shipDamageTaken = 0
     , shipHull = boatConfigMaxHull boat
@@ -267,9 +277,9 @@ validatePhysics path fields =
 validateBoat :: FilePath -> Fields -> Either [ConfigDiagnostic] BoatConfig
 validateBoat path fields =
   case values of
-    ( Just boatIdValue, Just displayNameValue, Just maxHullValue, Just renderedLengthValue, Just renderedWidthValue, Just battleSpeedValue, Just maxSpeedValue, Just accelerationValue, Just decelerationValue, Just turnRateValue, Just minimumTurnSpeedFactorValue, Just broadsideRangeConfigValue, Just broadsideDamageConfigValue, Just reloadTicksConfigValue, Just firingArcDegreesValue )
+    ( Just boatIdValue, Just displayNameValue, Just maxHullValue, Just renderedLengthValue, Just renderedWidthValue, Just battleSpeedValue, Just maxSpeedValue, Just accelerationValue, Just decelerationValue, Just turnRateValue, Just idealTurnSpeedValue, Just yawAccelerationValue, Just broadsideRangeConfigValue, Just broadsideDamageConfigValue, Just reloadTicksConfigValue, Just firingArcDegreesValue )
       | null allDiagnostics && boatIdValue == Text.pack (takeBaseName path) ->
-          Right BoatConfig {boatConfigId = boatIdValue, boatConfigDisplayName = displayNameValue, boatConfigMaxHull = maxHullValue, boatConfigRenderedLength = renderedLengthValue, boatConfigRenderedWidth = renderedWidthValue, boatConfigBattleSpeed = battleSpeedValue, boatConfigMaxSpeed = maxSpeedValue, boatConfigAcceleration = accelerationValue, boatConfigDeceleration = decelerationValue, boatConfigTurnRate = turnRateValue, boatConfigMinimumTurnSpeedFactor = minimumTurnSpeedFactorValue, boatConfigBroadsideRange = broadsideRangeConfigValue, boatConfigBroadsideDamage = broadsideDamageConfigValue, boatConfigReloadTicks = reloadTicksConfigValue, boatConfigFiringArcDegrees = firingArcDegreesValue}
+          Right BoatConfig {boatConfigId = boatIdValue, boatConfigDisplayName = displayNameValue, boatConfigMaxHull = maxHullValue, boatConfigRenderedLength = renderedLengthValue, boatConfigRenderedWidth = renderedWidthValue, boatConfigBattleSpeed = battleSpeedValue, boatConfigMaxSpeed = maxSpeedValue, boatConfigAcceleration = accelerationValue, boatConfigDeceleration = decelerationValue, boatConfigTurnRate = turnRateValue, boatConfigIdealTurnSpeed = idealTurnSpeedValue, boatConfigYawAcceleration = yawAccelerationValue, boatConfigBroadsideRange = broadsideRangeConfigValue, boatConfigBroadsideDamage = broadsideDamageConfigValue, boatConfigReloadTicks = reloadTicksConfigValue, boatConfigFiringArcDegrees = firingArcDegreesValue}
     _ -> Left allDiagnostics
  where
   (boatId, idDiagnostics) = requiredText path "id" fields
@@ -282,13 +292,14 @@ validateBoat path fields =
   (acceleration, accelerationDiagnostics) = requiredPositiveNumber path "acceleration" fields
   (deceleration, decelerationDiagnostics) = requiredPositiveNumber path "deceleration" fields
   (turnRate, turnRateDiagnostics) = requiredPositiveNumber path "turn_rate" fields
-  (minimumTurnSpeedFactor, minimumTurnSpeedFactorDiagnostics) = requiredUnitIntervalNumber path "minimum_turn_speed_factor" fields
+  (idealTurnSpeed, idealTurnSpeedDiagnostics) = requiredPositiveNumber path "ideal_turn_speed" fields
+  (yawAcceleration, yawAccelerationDiagnostics) = requiredPositiveNumber path "yaw_acceleration" fields
   (broadsideRangeValue, broadsideRangeDiagnostics) = requiredPositiveNumber path "broadside_range" fields
   (broadsideDamageValue, broadsideDamageDiagnostics) = requiredPositiveInt path "broadside_damage" fields
   (reloadTicksValue, reloadTicksDiagnostics) = requiredNonNegativeInt path "reload_ticks" fields
   (firingArcDegrees, firingArcDiagnostics) = requiredNumberWhere path "firing_arc_degrees" fields (\value -> value > 0 && value <= 180) "Must be greater than zero and no more than 180 degrees." "Use a firing arc in the range (0, 180]."
-  values = (boatId, displayName, maxHull, renderedLength, renderedWidth, battleSpeed, maxSpeed, acceleration, deceleration, turnRate, minimumTurnSpeedFactor, broadsideRangeValue, broadsideDamageValue, reloadTicksValue, firingArcDegrees)
-  diagnostics = concat [idDiagnostics, displayNameDiagnostics, maxHullDiagnostics, renderedLengthDiagnostics, renderedWidthDiagnostics, battleSpeedDiagnostics, maxSpeedDiagnostics, accelerationDiagnostics, decelerationDiagnostics, turnRateDiagnostics, minimumTurnSpeedFactorDiagnostics, broadsideRangeDiagnostics, broadsideDamageDiagnostics, reloadTicksDiagnostics, firingArcDiagnostics]
+  values = (boatId, displayName, maxHull, renderedLength, renderedWidth, battleSpeed, maxSpeed, acceleration, deceleration, turnRate, idealTurnSpeed, yawAcceleration, broadsideRangeValue, broadsideDamageValue, reloadTicksValue, firingArcDegrees)
+  diagnostics = concat [idDiagnostics, displayNameDiagnostics, maxHullDiagnostics, renderedLengthDiagnostics, renderedWidthDiagnostics, battleSpeedDiagnostics, maxSpeedDiagnostics, accelerationDiagnostics, decelerationDiagnostics, turnRateDiagnostics, idealTurnSpeedDiagnostics, yawAccelerationDiagnostics, broadsideRangeDiagnostics, broadsideDamageDiagnostics, reloadTicksDiagnostics, firingArcDiagnostics]
   boatIdMismatch =
     case boatId of
       Just value | value /= Text.pack (takeBaseName path) -> [diagnostic path Nothing Nothing (Just "id") "Boat id does not match its asset name." "Rename the id or the TOML file so both use the same boat kind."]
@@ -298,7 +309,12 @@ validateBoat path fields =
       (Just battleSpeedValue, Just maxSpeedValue)
         | battleSpeedValue > maxSpeedValue -> [diagnostic path Nothing Nothing (Just "battle_speed") "Must not exceed max_speed." "Lower battle_speed or raise max_speed."]
       _ -> []
-  allDiagnostics = diagnostics <> boatIdMismatch <> speedDiagnostics
+  idealTurnSpeedLimitDiagnostics =
+    case (idealTurnSpeed, maxSpeed) of
+      (Just idealTurnSpeedValue, Just maxSpeedValue)
+        | idealTurnSpeedValue > maxSpeedValue -> [diagnostic path Nothing Nothing (Just "ideal_turn_speed") "Must not exceed max_speed." "Lower ideal_turn_speed or raise max_speed."]
+      _ -> []
+  allDiagnostics = diagnostics <> boatIdMismatch <> speedDiagnostics <> idealTurnSpeedLimitDiagnostics
 
 requiredText :: FilePath -> Text -> Fields -> (Maybe Text, [ConfigDiagnostic])
 requiredText path key fields =
@@ -330,9 +346,6 @@ requiredPositiveNumber path key fields = requiredNumberWhere path key fields (> 
 
 requiredNonNegativeNumber :: FilePath -> Text -> Fields -> (Maybe Double, [ConfigDiagnostic])
 requiredNonNegativeNumber path key fields = requiredNumberWhere path key fields (>= 0) "Must be a non-negative finite number." "Use zero or a positive number."
-
-requiredUnitIntervalNumber :: FilePath -> Text -> Fields -> (Maybe Double, [ConfigDiagnostic])
-requiredUnitIntervalNumber path key fields = requiredNumberWhere path key fields (\value -> value >= 0 && value <= 1) "Must be between zero and one." "Use a decimal in the inclusive range 0 to 1."
 
 requiredNumberWhere :: FilePath -> Text -> Fields -> (Double -> Bool) -> Text -> Text -> (Maybe Double, [ConfigDiagnostic])
 requiredNumberWhere path key fields predicate message hint =
