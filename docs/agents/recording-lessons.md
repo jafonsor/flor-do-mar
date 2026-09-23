@@ -24,11 +24,10 @@ Prose is the residue of a lesson that cannot be encoded. Prefer it last: a
 documented rule waits for a reader to recall it at the right moment, while an
 encoded one applies itself.
 
-`testNavigationSteeringDoesNotWeave` in `test/CombatTest.hs` is the shape to copy.
-The weave was not filed as a caution: the throwaway harness that reproduced it
-(`test/DiagnosisTrajectoryShape.hs`) was promoted into a check in the suite that
-runs on every `combat-test`, and the harness now only exists for the next
-investigation.
+The strongest encoding is to promote the reproduction into a check. A throwaway
+harness proves the bug existed; a test in the suite that runs on every change keeps
+it fixed, and the write-up is then only needed for what the check cannot say. Ask
+which existing suite should fail if this recurs.
 
 ## Test whether it is a lesson at all
 
