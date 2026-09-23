@@ -1,21 +1,18 @@
 # Git In This Repo
 
-Read this before committing, switching branches, or rewriting history here. It
-records what actually happened when an agent was asked to commit and merge the
-mouse-navigation work, including the moment it nearly destroyed work that existed
-nowhere else.
+Read this before committing, switching branches, or rewriting history. It records
+what happened when an agent committed and merged the mouse-navigation work,
+including the moment it nearly destroyed work that existed nowhere else.
 
 ## Use `./scripts/git` (a bare `git` is refused)
-
-Run git through the wrapper at the repo root:
 
 ```bash
 ./scripts/git status --short
 ./scripts/git log --oneline -5
 ```
 
-Every argument passes through untouched, so use it exactly as you would git. It
-exists because the harness refuses git reached the ordinary way:
+Arguments pass through untouched, so use it exactly as you would git. The harness
+refuses git reached the ordinary way:
 
 ```
 $ git --version                  → error: tool 'git' not found
@@ -25,59 +22,52 @@ $ nix develop --command git ...  → error: tool 'git' not found
 $ /nix/store/…-git-2.55.0/bin/git --version → git version 2.55.0
 ```
 
-The denial follows the **resolved binary**, not the command word. On this machine
-`/usr/bin/git` is the Apple/Xcode build, and that is the one git the harness
-refuses; every nix-built git in the store runs. Two facts pin it down:
+The refusal follows the **resolved binary**, not the command word. `/usr/bin/git`
+is the Apple/Xcode build, and that is the one git refused here; every nix-built git
+in the store runs. Two tests prove it: inside a `nix develop` shell `command -v git`
+prints `/usr/bin/git` while running it is still refused, and a renamed copy of git's
+binary is refused or allowed according to which binary it execs.
 
-- Inside a `nix develop` shell, `command -v git` happily prints `/usr/bin/git`
-  while running it is still refused — so it is not a PATH or packaging problem.
-- A copy of git's binary under a different name, whose script execs `/usr/bin/git`,
-  is refused too, and the same copy exec'ing the nix-store path works.
-
-So adding `pkgs.git` to `flake.nix` would change which binary PATH resolves to and
-still be refused. Do not spend time on it. Escalating does not help either: a
-`danger-full-access` retry of `/usr/bin/git` fails identically, because the harness
-decides before the sandbox is consulted.
+`pkgs.git` in `flake.nix` would only change which binary PATH resolves to, and that
+binary is still refused — do not spend time on it. Escalating does not help either:
+a `danger-full-access` retry of `/usr/bin/git` fails the same way, because the
+harness decides before the sandbox is consulted.
 
 The wrapper pins `/nix/store/304vhl9qr5774qkv5rrqa0xbg429j2kk-git-2.55.0/bin/git`
-and prints what to do if that path is ever collected. Override it for one command
-with `FLOR_DO_MAR_GIT=/nix/store/…/bin/git ./scripts/git …`;
-`ls -d /nix/store/*git-*/bin/git` lists the candidates.
+and prints what to do if that path is collected. Override it for one command with
+`FLOR_DO_MAR_GIT=/nix/store/…/bin/git ./scripts/git …`; `ls -d
+/nix/store/*git-*/bin/git` lists the candidates.
 
 **Done when** `./scripts/git rev-parse --is-inside-work-tree` prints `true`.
 
 ## `--hard` destroys work that exists only in the working tree
 
-The trap that nearly cost the work: a `git reset --hard` looked safe because every
-feature already had a commit, but `test/CombatTest.hs` was not in any of them at
-its current size. The reset silently reverted it from 1640 lines to 744, deleting
-roughly 900 lines of navigation tests and the steering regression test.
-
-A green test run proves the *files* are correct. It says nothing about whether the
-*commits* contain them. When those two disagree, `--hard` keeps the commits and
-throws away the files.
+A `git reset --hard` looked safe because every feature had a commit. It was not:
+`test/CombatTest.hs` was in none of them at its current size, and the reset
+reverted it from 1640 lines to 744 — about 900 lines of navigation tests, plus the
+steering regression test. A green test run proves the *files* are right and says
+nothing about the *commits*; when the two disagree, `--hard` keeps the commits and
+discards the files.
 
 ```bash
-./scripts/git status --short          # a clean tree here does NOT mean the work is committed
-./scripts/git log --oneline -5        # confirm each file you care about is in a commit
+./scripts/git status --short          # a clean tree does NOT mean the work is committed
+./scripts/git log --oneline -5        # check each file you care about is in a commit
 ```
 
 Two habits make this safe:
 
-- Snapshot first. `cp` the files you are about to risk to `/tmp/` before any reset,
-  checkout, or rebase. It costs one command and it is what made recovery possible.
-- Prefer `--soft` or `--mixed` over `--hard`. Both leave the working tree alone;
-  only the branch pointer and the index move. Every re-slicing of the commit
-  history in this session used `--soft` for that reason.
+- Snapshot first: `cp` the files you are about to risk to `/tmp/` before any reset,
+  checkout, or rebase. It is one command, and it is what made recovery possible.
+- Prefer `--soft` or `--mixed` to `--hard`. Both move only the branch pointer and
+  the index, leaving the working tree alone.
 
-**Done when** you have named, file by file, where the work you care about lives:
-in a commit, or in a `/tmp` snapshot.
+**Done when** you can name, file by file, where the work lives: in a commit, or in
+a `/tmp` snapshot.
 
-## Every commit is a place to check your work
+## Check every commit
 
-A commit that reports success can still contain the wrong files. A staged set that
-is short by one path commits happily, and nothing about the commit says so. Two
-checks catch it every time:
+A commit can report success and still hold the wrong files: a staged set short by
+one path commits happily, and the commit does not say so. Two checks catch it:
 
 ```bash
 ./scripts/git diff --cached --name-only    # exactly the files you meant, no more, no fewer
@@ -87,67 +77,64 @@ EOF
 ./scripts/git show --stat --format="" HEAD # what the commit actually contains
 ```
 
-Two specific misfires seen here:
+Two misfires seen here:
 
-- `./scripts/git commit -a` after `./scripts/git reset --mixed <commit>` creates a **new** commit on
-  top instead of folding into the existing one, leaving two commits with the same
-  message and the fix still in the old one. To fold, stage the files and use
-  `./scripts/git commit --amend`.
-- Checking a multi-commit history with `grep` on a one-line `--oneline` summary
-  tells you nothing about file contents. Inspect the commit you care about with
-  `./scripts/git show <commit>:<path>`.
+- `./scripts/git commit -a` after `./scripts/git reset --mixed <commit>` creates a
+  **new** commit on top instead of folding into the existing one: two commits
+  sharing a message, with the change still in the old one. To fold, stage the files
+  and use `./scripts/git commit --amend`.
+- `grep` over a one-line `--oneline` summary says nothing about file contents.
+  Inspect a commit with `./scripts/git show <commit>:<path>`.
 
-**Done when** every commit's `--stat` matches the change you intended to record.
+**Done when** every commit's `--stat` matches the change you meant to record.
 
 ## Rescue: the object store outlives the commits you erase
 
 A reset moves a branch pointer; it does not immediately delete the commits that
-were reachable. Anything committed earlier remains addressable by hash as long as
-it is recent, so recovery never depends on the files you just overwrote:
+were reachable, so anything committed earlier stays addressable by hash while it is
+recent. Recovery does not need the files you overwrote:
 
 ```bash
 ./scripts/git show <commit>:<path> > <path>   # restore one file from an erased commit
-./scripts/git reflog                            # the pre-reset tip, if you lost the hashes
+./scripts/git reflog                          # the pre-reset tip, if you lost the hashes
 ```
 
-That is how `test/CombatTest.hs` came back, from the commit that had held it.
+That is how `test/CombatTest.hs` came back.
 
-**Done when** the restored file is back on disk and its test suite passes again.
+**Done when** the restored file is on disk and its test suite passes again.
 
-## Rewinding a messy sequence
+## Rewind a messy sequence
 
 When commits land in the wrong shape, rewind to before the mess and redo, rather
 than editing forward:
 
 ```bash
-./scripts/git reset --soft <last good commit>   # branch pointer moves, index and files keep everything
+./scripts/git reset --soft <last good commit>   # pointer moves; index and files keep everything
 ./scripts/git reset                             # unstage all, so you can re-stage deliberately
 ```
 
-Then re-commit one slice at a time, running the checks above after each. For a
-history whose *messages* are wrong but whose trees are right, `--amend` and
-`--soft` re-commits are enough, and the tree never changes.
+Then re-commit one slice at a time, running the checks above after each. If only
+the *messages* are wrong and the trees are right, `--amend` and `--soft` re-commits
+are enough and the tree never changes.
 
-**Done when** `./scripts/git show --stat` for each rewritten commit shows exactly its own
-slice, and the tree at the tip is unchanged.
+**Done when** `./scripts/git show --stat` shows exactly its own slice for each
+rewritten commit, and the tree at the tip is unchanged.
 
 ## Repo specifics
 
-- Identity is already configured: `João Rodrigues <jrodrigues@imaginarycloud.com>`.
-- This harness already runs with the dev shell's tools on PATH — `ghc`, `cabal`,
-  `ghcid`, `nixfmt`, `playwright`, `node` all resolve to `/nix/store` paths. Run
-  `cabal` directly; wrapping it in `nix develop --command` only adds a nix
-  evaluation, and that evaluation tries to write nix's fetcher cache outside the
-  workspace and gets denied.
+- Identity is configured: `João Rodrigues <jrodrigues@imaginarycloud.com>`.
+- This harness already has the dev shell tools on PATH: `ghc`, `cabal`, `ghcid`,
+  `nixfmt`, `playwright` and `node` all resolve to `/nix/store` paths. Run `cabal`
+  directly. `nix develop --command` only adds a nix evaluation that gets denied
+  writing nix's fetcher cache outside the workspace.
 - Build with `CABAL_DIR="$PWD/.cabal-local" cabal build all`. Cabal's default log
-  path is outside the workspace and its write failure lands *after* a successful
-  link, which reads as a broken build.
-- The frontend check named in `AGENTS.md` is the stand-in for "did I break the
-  client": `cabal build flor-do-mar-client`. If you are in an environment *without*
-  the dev shell on PATH, the `nix develop --command` form of that command is the
-  documented way in.
-- Commits land on `main` by fast-forward while the feature branch is unmerged. When
-  `main` is an ancestor of the branch, `./scripts/git merge --ff-only <branch>` cannot
-  conflict; check with `./scripts/git merge-base main HEAD` and `./scripts/git rev-parse main`.
-- Pushing is the human's job unless asked. Nothing in the workflow above touches a
-  remote.
+  path is outside the workspace and that write fails *after* a successful link, so
+  the build looks broken when it is not.
+- The frontend check in `AGENTS.md` stands in for "did I break the client":
+  `cabal build flor-do-mar-client`. Without the dev shell on PATH, the
+  `nix develop --command` form is the documented way in.
+- `main` takes fast-forward merges while the feature branch is unmerged. When `main`
+  is an ancestor of the branch, `./scripts/git merge --ff-only <branch>` cannot
+  conflict; check with `./scripts/git merge-base main HEAD` and `./scripts/git
+  rev-parse main`.
+- Pushing is the human's job unless asked. Nothing above touches a remote.
