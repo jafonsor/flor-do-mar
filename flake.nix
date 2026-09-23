@@ -82,6 +82,7 @@
               playwrightCli
               pkgs.playwright-driver.browsers
               pkgs.nixfmt
+              pkgs.git
             ];
 
             NODE_PATH = "${playwrightNodeModules}/node_modules";
