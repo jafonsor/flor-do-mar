@@ -30,18 +30,29 @@ for d in "$STAGE"/*/; do
 done
 echo "    installed $(ls "$CANON" | wc -l | tr -d ' ') skills"
 
-echo "==> 3. Remove retired skills from $CLAUDE"
+echo "==> 3. Remove retired symlinks from $CLAUDE"
+# Only symlinks are removed. A real directory that is absent from $CANON was never
+# part of the managed set, so "missing from $CANON" does not make it retired:
+# removing those is how ~/.claude/skills/use-codex was lost. Report them instead.
 removed=0
+skipped=()
 for entry in "$CLAUDE"/*; do
   [ -e "$entry" ] || [ -L "$entry" ] || continue
   name="$(basename "$entry")"
-  if [ ! -d "$CANON/$name" ]; then
-    rm -rf "$entry"
-    echo "    removed $name"
+  [ -d "$CANON/$name" ] && continue
+  if [ -L "$entry" ]; then
+    rm -f "$entry"
+    echo "    removed link $name"
     removed=$((removed + 1))
+  else
+    skipped+=("$name")
   fi
 done
-echo "    removed $removed retired entries"
+echo "    removed $removed retired symlinks"
+if [ "${#skipped[@]}" -gt 0 ]; then
+  echo "    NOT removed (not symlinks, so not ours to delete): ${skipped[*]}"
+  echo "    Review them, then delete manually if they are obsolete."
+fi
 
 echo "==> 4. Ensure a correct relative symlink for every released skill"
 for d in "$CANON"/*/; do
