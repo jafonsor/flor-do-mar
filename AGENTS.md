@@ -16,6 +16,10 @@ This repo uses a single-context domain documentation layout. See `docs/agents/do
 
 Movement tests and browser-driving traps that produce false signals. See `docs/agents/testing-and-tooling.md`.
 
+### Git
+
+The harness blocks `git` by name, and `reset --hard` destroys work that exists only in the working tree. See `docs/agents/git-workflow.md` before committing, switching branches, or rewriting history.
+
 ### Frontend checks
 
 After frontend changes, run `nix develop --command cabal build flor-do-mar-client` to catch client compile errors before handoff.
