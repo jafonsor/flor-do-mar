@@ -12,29 +12,26 @@ Git usage guidelines for this repo.
 Arguments pass through untouched, so use it exactly as you would git. A bare `git`
 does not run here, so call the wrapper every time.
 
-The wrapper pins `/nix/store/304vhl9qr5774qkv5rrqa0xbg429j2kk-git-2.55.0/bin/git`
-and prints what to do if that path is collected. Override it for one command with
-`FLOR_DO_MAR_GIT=/nix/store/…/bin/git ./scripts/git …`; `ls -d
-/nix/store/*git-*/bin/git` lists the candidates. Confirm the wrapper works with
-`./scripts/git rev-parse --is-inside-work-tree`.
+It pins `/nix/store/304vhl9qr5774qkv5rrqa0xbg429j2kk-git-2.55.0/bin/git` and says
+what to do if that path is collected. Check it with `./scripts/git rev-parse
+--is-inside-work-tree`; override it for one command with
+`FLOR_DO_MAR_GIT=/nix/store/…/bin/git ./scripts/git …`, and find candidates with
+`ls -d /nix/store/*git-*/bin/git`.
 
 ## Never `reset --hard` on uncommitted work
 
-`--hard` keeps the commits and discards the files, so it deletes work that exists
-only in the working tree — even when the tree looks clean and every feature has a
-commit. A green test run proves the *files* are right and says nothing about the
-*commits*.
+`--hard` discards the working-tree files, so it destroys work that is not in a
+commit yet — even when the tree looks clean and every feature has one. A green test
+run proves the *files* are right, never the *commits*: check before you trust it.
 
 ```bash
-./scripts/git status --short          # a clean tree does NOT mean the work is committed
+./scripts/git status --short          # clean tree does NOT mean the work is committed
 ./scripts/git log --oneline -5        # check each file you care about is in a commit
 ```
 
-Before any reset, checkout, or rebase:
-
-- `cp` the files you are about to risk to `/tmp/`.
-- Prefer `--soft` or `--mixed`. Both move only the branch pointer and the index,
-  leaving the working tree alone.
+Before any reset, checkout, or rebase: `cp` the files you are about to risk to
+`/tmp/`, and prefer `--soft` or `--mixed`, which move only the branch pointer and
+the index.
 
 ## Check every commit
 
@@ -48,16 +45,16 @@ EOF
 ./scripts/git show --stat --format="" HEAD # what the commit actually contains
 ```
 
-- `./scripts/git commit -a` after `./scripts/git reset --mixed <commit>` creates a
-  **new** commit on top instead of folding into the existing one: two commits
-  sharing a message, with the change still in the old one. To fold, stage the files
-  and use `./scripts/git commit --amend`.
-- `grep` over a one-line `--oneline` summary says nothing about file contents.
-  Inspect a commit with `./scripts/git show <commit>:<path>`.
+- To fold a change into an existing commit, stage the files and use
+  `./scripts/git commit --amend`. After `./scripts/git reset --mixed <commit>`,
+  `commit -a` creates a **new** commit on top instead: two commits sharing a
+  message, with the change still in the old one.
+- `--oneline` and `grep` say nothing about file contents. Read a commit with
+  `./scripts/git show <commit>:<path>`.
 
 ## Recovery: erased commits stay addressable
 
-A reset moves a branch pointer; it does not delete the commits that were reachable,
+A reset moves a branch pointer without deleting the commits that were reachable,
 so anything committed earlier stays addressable by hash while it is recent.
 
 ```bash
@@ -67,7 +64,7 @@ so anything committed earlier stays addressable by hash while it is recent.
 
 ## Rewind a messy sequence
 
-Rewrite by going back to before the mess, not by editing forward:
+Rewind to before the mess instead of editing forward:
 
 ```bash
 ./scripts/git reset --soft <last good commit>   # pointer moves; index and files keep everything
@@ -75,22 +72,21 @@ Rewrite by going back to before the mess, not by editing forward:
 ```
 
 Then re-commit one slice at a time, checking each. If only the *messages* are wrong
-and the trees are right, `--amend` and `--soft` re-commits are enough.
+and the trees are right, `--amend` alone is enough.
 
 ## Repo specifics
 
 - Identity is configured: `João Rodrigues <jrodrigues@imaginarycloud.com>`.
-- Run `cabal` directly. The dev shell tools (`ghc`, `cabal`, `ghcid`, `nixfmt`,
-  `playwright`, `node`) are already on PATH from `/nix/store`;
-  `nix develop --command` only adds a nix evaluation that gets denied writing nix's
-  fetcher cache outside the workspace.
+- Run `cabal` directly. The dev shell tools are already on PATH; `nix develop
+  --command` only adds a nix evaluation that gets denied writing nix's fetcher cache
+  outside the workspace.
 - Build with `CABAL_DIR="$PWD/.cabal-local" cabal build all`. Cabal's default log
   path is outside the workspace and that write fails *after* a successful link, so
   the build looks broken when it is not.
 - The frontend check is `cabal build flor-do-mar-client`. Without the dev shell on
   PATH, use the `nix develop --command` form from `AGENTS.md`.
-- `main` takes fast-forward merges while the feature branch is unmerged. When `main`
-  is an ancestor of the branch, `./scripts/git merge --ff-only <branch>` cannot
-  conflict; check with `./scripts/git merge-base main HEAD` and `./scripts/git
-  rev-parse main`.
+- `main` takes fast-forward merges while the feature branch is unmerged. If `main`
+  is an ancestor, `./scripts/git merge --ff-only <branch>` cannot conflict; if it is
+  not, that command refuses (exit 128) and changes nothing, so it is safe to try.
+  To check first: `./scripts/git merge-base main HEAD`.
 - Pushing is the human's job unless asked.
