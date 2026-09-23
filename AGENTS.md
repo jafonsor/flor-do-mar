@@ -20,6 +20,10 @@ Movement tests and browser-driving traps that produce false signals. See `docs/a
 
 Use `./scripts/git`, not `git` — the harness refuses the git PATH resolves to here. See `docs/agents/git-workflow.md` before committing, switching branches, or rewriting history.
 
+### Recording lessons
+
+When work turns up something worth keeping, propose where it goes before writing it. See `docs/agents/recording-lessons.md`.
+
 ### Frontend checks
 
 After frontend changes, run `nix develop --command cabal build flor-do-mar-client` to catch client compile errors before handoff.
