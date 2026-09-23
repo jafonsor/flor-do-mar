@@ -9,27 +9,8 @@ Git usage guidelines for this repo.
 ./scripts/git log --oneline -5
 ```
 
-Arguments pass through untouched. The harness refuses git reached the ordinary
-way:
-
-```
-$ git --version                  → error: tool 'git' not found
-$ /usr/bin/git --version         → error: tool 'git' not found
-$ env git --version              → error: tool 'git' not found
-$ nix develop --command git ...  → error: tool 'git' not found
-$ /nix/store/…-git-2.55.0/bin/git --version → git version 2.55.0
-```
-
-The refusal follows the **resolved binary**, not the command word. `/usr/bin/git`
-is the Apple/Xcode build, and that is the one git refused here; every nix-built git
-in the store runs. Two tests prove it: inside a `nix develop` shell `command -v git`
-prints `/usr/bin/git` while running it is still refused, and a renamed copy of git's
-binary is refused or allowed according to which binary it execs.
-
-`pkgs.git` in `flake.nix` would only change which binary PATH resolves to, and that
-binary is still refused. Escalating does not help either: a `danger-full-access`
-retry of `/usr/bin/git` fails the same way, because the harness decides before the
-sandbox is consulted.
+Arguments pass through untouched, so use it exactly as you would git. A bare `git`
+does not run here, so call the wrapper every time.
 
 The wrapper pins `/nix/store/304vhl9qr5774qkv5rrqa0xbg429j2kk-git-2.55.0/bin/git`
 and prints what to do if that path is collected. Override it for one command with
