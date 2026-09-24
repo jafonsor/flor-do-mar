@@ -190,7 +190,6 @@ app combatConfig = do
           shipPanel "Enemy" EnemyShip snapshotDynamic
           engagementPanel snapshotDynamic
 
-        commandEvents <- controls
         tickEvents <-
           widgetHold
             (tickLossyFromPostBuildTime (realToFrac (combatConfigTickSeconds combatConfig)))
@@ -218,7 +217,7 @@ app combatConfig = do
             attachWith
               (\fallback command -> liftIO (keepSnapshot fallback <$> combatApiSubmitCommand api command))
               (current snapshotDynamic)
-              (leftmost [navigationCommandEvents, controlCommand commandEvents])
+              navigationCommandEvents
           reloadRequests =
             attachWith
               (\fallback _ -> liftIO (keepSnapshot fallback <$> combatApiObserveSnapshot api))
@@ -247,24 +246,6 @@ app combatConfig = do
             (leftmost [reloadSnapshots, launchSnapshots, commandSnapshots, tickSnapshots])
         pure ()
     pure ()
-
-data ControlEvents t = ControlEvents
-  { controlCommand :: Event t CombatCommand
-  }
-
-controls :: Widget x (ControlEvents DomTimeline)
-controls =
-  elClass "section" "controls" $ do
-    firePortEvent <- button "Fire port"
-    fireStarboardEvent <- button "Fire starboard"
-    pure
-      ControlEvents
-        { controlCommand =
-            leftmost
-              [ FireBroadside PlayerShip EnemyShip Port <$ firePortEvent
-              , FireBroadside PlayerShip EnemyShip Starboard <$ fireStarboardEvent
-              ]
-        }
 
 setupOverlay :: [BoatConfig] -> SetupState -> Widget x (Event DomTimeline SetupAction)
 setupOverlay boatConfigs setupState =
@@ -471,7 +452,6 @@ stylesheet =
     , ".scenario { color: #a9c7da; font-size: 14px; }"
     , ".status-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }"
     , ".panel { border: 1px solid #203447; border-radius: 8px; padding: 12px; min-height: 74px; background: #0b1720; font-size: 13px; line-height: 1.45; }"
-    , ".controls { display: flex; flex-wrap: wrap; gap: 8px; }"
     , "button { border: 1px solid #2d506a; border-radius: 6px; background: #102536; color: #e6edf3; padding: 8px 10px; font: inherit; cursor: pointer; }"
     , "button:hover { background: #17344a; }"
     , ".setup-overlay { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 24px; background: rgba(2, 10, 16, 0.8); }"

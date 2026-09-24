@@ -16,6 +16,7 @@ module FlorDoMar.Combat.Api
   , combatSnapshotFromStateWith
   , combatSnapshotFromStateWithPlanning
   , planNavigationForSnapshot
+  , shipFromSnapshot
   )
 where
 
@@ -85,6 +86,8 @@ data ShipSnapshot = ShipSnapshot
   , shipSnapshotRenderedLength :: Double
   , shipSnapshotRenderedWidth :: Double
   , shipSnapshotReload :: Int
+  , shipSnapshotLockedTarget :: Maybe ShipId
+  , shipSnapshotFirePermission :: Bool
   }
   deriving stock (Eq, Show)
 
@@ -162,6 +165,8 @@ shipSnapshot tickSeconds movementForShip ship =
     , shipSnapshotRenderedLength = shipRenderedLength ship
     , shipSnapshotRenderedWidth = shipRenderedWidth ship
     , shipSnapshotReload = shipReload ship
+    , shipSnapshotLockedTarget = shipLockedTarget ship
+    , shipSnapshotFirePermission = shipFirePermission ship
     }
  where
   movement = movementForShip ship
@@ -211,6 +216,8 @@ shipFromSnapshot snapshot =
     , shipRenderedLength = shipSnapshotRenderedLength snapshot
     , shipRenderedWidth = shipSnapshotRenderedWidth snapshot
     , shipReload = shipSnapshotReload snapshot
+    , shipLockedTarget = shipSnapshotLockedTarget snapshot
+    , shipFirePermission = shipSnapshotFirePermission snapshot
     }
 
 pointDistance :: Point -> Point -> Double

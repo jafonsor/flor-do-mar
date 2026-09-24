@@ -120,6 +120,8 @@ Gun range becomes **48 world units** (three lengths of the big ship) instead of 
 
 In dependency order. Each one is meant to leave the tree building and the suite passing.
 
+**Building is not playing.** Between issue 01 and issue 06 nothing can fire at all: issue 01 deletes `FireBroadside`, which takes the client's fire buttons out of the tree with it, and the gun panel that replaces them only lands in issue 06. Issues 02 to 05 are domain, config, snapshot and AI work. That gap is intended — do not add a bridging control to keep firing alive in the meantime, and do not weaken issue 01 to avoid it.
+
 1. [Model locked targets and fire permission](./issues/01-model-locked-targets-and-fire-permission.md)
 2. [Fire volleys automatically from a tick phase](./issues/02-fire-volleys-automatically.md)
 3. [Reduce gun range and fit the engagement on screen](./issues/03-reduce-range-and-fit-engagement-on-screen.md)

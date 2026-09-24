@@ -40,4 +40,6 @@ None. This is the first issue.
 ## Notes for whoever implements it
 
 - Removing `FireBroadside` breaks the client's fire buttons and several existing tests. That is expected: the client's gun panel arrives in a later issue, and the existing firing tests are rewritten by the automatic-fire issue. Update the tests that will not compile rather than leaving the tree broken.
+- **Nothing can fire between this issue and issue 06, and that is intended.** Deleting `FireBroadside` takes the client's "Fire port" and "Fire starboard" buttons out of the tree, and the gun panel that replaces them only arrives in issue 06; issues 02 to 05 are domain, config, snapshot and AI work. Do not add a bridging control to keep firing alive in the meantime, and do not weaken this issue to avoid the gap. "Leaves the tree building and the suite passing" means exactly that, not "playable".
+- The two commands are `Lock shipId targetId`, which locks that target or releases it when it is already locked, and `SetFireAtWill shipId permitted`. Both names come from the Targeting and Gunnery glossary in `CONTEXT.md`, and later issues and the client use them unchanged.
 - The scope is deliberately quiet. Nothing fires at the end of this issue, which means the existing reload tests are the ones that prove the new state does not disturb the cooldown.

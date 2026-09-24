@@ -151,6 +151,11 @@ applyConfigToCombatState config state =
     , combatEnemy = applyConfigToShip config (combatEnemy state)
     }
 
+-- | Refresh the values a boat kind owns while retaining per-instance state.
+--
+-- A ship's locked target and its permission to fire are live state, like the
+-- reload counter and the damage taken, so they are deliberately not refreshed
+-- here: a config hot reload must not release a lock or disarm the guns.
 applyConfigToShip :: CombatConfig -> Ship -> Ship
 applyConfigToShip config ship =
   case findBoatConfig (shipBoatKind ship) config of
@@ -226,6 +231,8 @@ shipFromConfig identity position heading boat =
     , shipRenderedLength = boatConfigRenderedLength boat
     , shipRenderedWidth = boatConfigRenderedWidth boat
     , shipReload = 0
+    , shipLockedTarget = Nothing
+    , shipFirePermission = False
     }
 
 loadTomlFile :: FilePath -> IO (Either [ConfigDiagnostic] Fields)

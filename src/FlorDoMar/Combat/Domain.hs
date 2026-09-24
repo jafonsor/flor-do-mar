@@ -20,10 +20,12 @@ module FlorDoMar.Combat.Domain
   , ShipId (..)
   , TrajectorySample (..)
   , Wind (..)
+  , applyBroadsideDamage
   , broadsideDamage
   , broadsideRange
   , canFireBroadside
   , canFireBroadsideWith
+  , canLockTarget
   , caravelaDuel
   , legacyBroadsideTuning
   , legacyMovementPhysics
@@ -147,6 +149,11 @@ data Ship = Ship
   , shipRenderedLength :: Double
   , shipRenderedWidth :: Double
   , shipReload :: Int
+  -- | Fire-control state. Like the reload counter and the damage taken, it is
+  -- live ship state rather than boat configuration: a config hot reload
+  -- refreshes what the boat kind owns and leaves this alone.
+  , shipLockedTarget :: Maybe ShipId
+  , shipFirePermission :: Bool
   }
   deriving stock (Eq, Show)
 
@@ -186,7 +193,13 @@ data CombatCommand
   -- | Compatibility for the pre-navigation controls. New movement code should
   -- issue 'SetTargetSpeed' directly.
   | SetSails ShipId SailState
-  | FireBroadside ShipId ShipId BroadsideSide
+  -- | Acquire or release the locked target: naming the ship that is already
+  -- locked releases it, so taking a target and letting one go are the same
+  -- command. The first identity is the ship locking, the second the target.
+  | Lock ShipId ShipId
+  -- | Permit or forbid a ship's guns to fire. It is independent of the locked
+  -- target and of the reload, so it needs neither a lock nor loaded guns.
+  | SetFireAtWill ShipId Bool
   deriving stock (Eq, Show)
 
 data BroadsideCheck
@@ -197,6 +210,12 @@ data BroadsideCheck
   | BroadsideReloading Int
   | TargetOutOfRange Double
   | TargetOutsideFiringArc Double
+  -- | A lock naming the ship that is locking. The client does not send one, and
+  -- the arc maths happens to make a self-target harmless today; neither is a
+  -- rule the domain may rely on.
+  | TargetIsSelf ShipId
+  -- | A lock naming a ship the scenario does not carry.
+  | TargetNotInScenario ShipId
   deriving stock (Eq, Show)
 
 broadsideRange :: Double
@@ -309,10 +328,42 @@ caravela identity position heading =
     , shipRenderedLength = 10
     , shipRenderedWidth = 4
     , shipReload = 0
+    , shipLockedTarget = Nothing
+    , shipFirePermission = False
     }
 
+-- | Whether @lockerId@ may acquire or release a lock on @targetId@.
+--
+-- A lock is a fire-control solution, so it is validated here beside the
+-- broadside checks rather than only in the input layer. The refusal vocabulary
+-- is 'BroadsideCheck' on purpose: that is the guard chain's vocabulary for a
+-- refused gunnery command, and locking is the first step of that chain.
+--
+-- Only the two rules that make a lock a lock live here: a ship may not lock
+-- itself, and it may not lock a ship the scenario does not carry.
+canLockTarget :: CombatState -> ShipId -> ShipId -> BroadsideCheck
+canLockTarget state lockerId targetId
+  | lockerId == targetId = TargetIsSelf targetId
+  | not (scenarioContainsShip targetId state) = TargetNotInScenario targetId
+  | otherwise = BroadsideReady
+
+-- | Whether the scenario carries a ship with this identity.
+--
+-- Membership is read from the ships in the state rather than assumed from the
+-- 'ShipId' type. The duel has exactly two hulls today, so the check only ever
+-- refuses an identity no ship in the state answers to; a wider roster inherits
+-- the rule unchanged.
+scenarioContainsShip :: ShipId -> CombatState -> Bool
+scenarioContainsShip identity state =
+  identity `elem` fmap shipId [combatPlayer state, combatEnemy state]
+
+-- | The total, pure command transition.
+--
+-- The broadside tuning argument stays in the signature because the firing phase
+-- that consumes it arrives in the next issue; nothing in this issue fires, so it
+-- is not read here yet.
 applyCommand :: Double -> (Ship -> MovementPhysics) -> (Ship -> BroadsideTuning) -> CombatState -> CombatCommand -> CombatState
-applyCommand tickSeconds movementForShip broadsideTuningForShip state command =
+applyCommand tickSeconds movementForShip _broadsideTuningForShip state command =
   case command of
     SetHeading identity heading ->
       updateNavigatingShip identity (\ship -> ship {shipTargetHeading = normalizeHeading heading}) state
@@ -331,14 +382,29 @@ applyCommand tickSeconds movementForShip broadsideTuningForShip state command =
               }
         )
         state
-    FireBroadside attackerId targetId side ->
-      case canFireBroadsideWith broadsideTuningForShip state attackerId targetId side of
-        BroadsideReady ->
-          let tuning = broadsideTuningForShip (selectShip attackerId state)
-           in updateShip attackerId (\ship -> ship {shipReload = broadsideTuningReloadTicks tuning}) $
-                updateShip targetId (applyBroadsideDamage (broadsideTuningDamage tuning)) state
+    Lock lockerId targetId ->
+      case canLockTarget state lockerId targetId of
+        BroadsideReady -> updateShip lockerId (toggleLockedTarget targetId) state
         _ -> state
+    SetFireAtWill identity permitted ->
+      updateShip identity (\ship -> ship {shipFirePermission = permitted}) state
 
+-- | Take the named target, or let go of the one already held.
+toggleLockedTarget :: ShipId -> Ship -> Ship
+toggleLockedTarget targetId ship =
+  ship
+    { shipLockedTarget =
+        if shipLockedTarget ship == Just targetId
+          then Nothing
+          else Just targetId
+    }
+
+-- | Apply one volley's damage to a ship, keeping the damage recorded and the
+-- hull consistent.
+--
+-- The firing phase that consumes this arrives in the next issue, so for now it
+-- has no caller in the simulation; the tests drive it directly rather than
+-- restating the accounting in their fixtures.
 applyBroadsideDamage :: Int -> Ship -> Ship
 applyBroadsideDamage damage ship =
   ship

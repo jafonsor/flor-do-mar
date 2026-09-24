@@ -2,7 +2,6 @@
 
 module Main (main) where
 
-import Control.Monad (replicateM_)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import FlorDoMar.Client.BattleInput
@@ -19,10 +18,14 @@ main = do
   assertEqual "combat hello" "Hello from the local combat core." helloCombat
   assertEqual "initial scenario" "Portuguese caravela duel" initialScenarioName
   testTickAdvancement
-  testValidBroadsideDamage
+  testDuelStartsWithNoFiringState
+  testLockCommandTogglesTheLockedTarget
+  testSelfLockIsRefusedAndLeavesTheLockAlone
+  testLockOnAShipOutsideTheScenarioIsRefused
+  testFireAtWillIsIndependentOfTheLock
   testInvalidBroadsideRange
   testInvalidBroadsideArc
-  testReloadCooldown
+  testReloadCooldownIsUnaffectedByFiringStateCommands
   testTerminalHullState
   testLoadsRuntimeCombatConfig
   testRejectsMalformedRuntimeCombatConfig
@@ -31,6 +34,8 @@ main = do
   testRejectsMissingRuntimeCombatConfig
   testLocalApiStartsCaravelaDuel
   testConfiguredLocalApiStartsBigVsSmall
+  testConfiguredEngagementStartsWithNoFiringState
+  testHotReloadKeepsLockAndFirePermission
   testConfiguredMovementPhysics
   testNavigationPlannerClampsAndCommitsOrders
   testNavigationProjectionMatchesExecution
@@ -38,13 +43,12 @@ main = do
   testNavigationArrivalPreservesSpeedIntent
   testMouseNavigationCommandLifecycle
   testStoppedNavigationOrderBuildsWay
-  testBroadsideKeepsActiveNavigationOrder
+  testFiringStateCommandsKeepActiveNavigationOrder
   testDisabledShipsClearAndIgnoreNavigation
   testNavigationSafetyCapIsSurfaced
   testLocalApiExposesNavigationOrder
   testEnemyOrbitAutopilotIssuesNavigationOrders
   testConfiguredBroadsideTuning
-  testConfiguredLocalApiBroadsideTuning
   testConfiguredMovementSnapshot
   testConfiguredLocalApiHotReloadsLiveEngagement
   testHotReloadPreservesCommittedNavigationWaypoint
@@ -53,8 +57,9 @@ main = do
   testConfiguredLocalApiRestartsSelectedEngagement
   testSetupOverlayState
   testSetupDebugOverlayState
+  testSnapshotCarriesLockedTargetAndFirePermission
   testLocalApiQueuesCommandsUntilTick
-  testLocalApiReportsTerminalState
+  testLocalApiExposesLockedTargetAndFirePermission
   testInitialBattleRenderScene
   testDamagedBattleRenderSceneTint
   testActiveNavigationRenderScene
@@ -166,12 +171,63 @@ testTickAdvancement = do
   assertApprox "player moves east on battle sails" 4 (pointX playerPosition)
   assertApprox "player y remains stable" 0 (pointY playerPosition)
 
-testValidBroadsideDamage :: IO ()
-testValidBroadsideDamage = do
-  let fired = tickCombat [FireBroadside PlayerShip EnemyShip Port] caravelaDuel
-  assertEqual "broadside check ready" BroadsideReady (canFireBroadside caravelaDuel PlayerShip EnemyShip Port)
-  assertEqual "enemy hull damaged" 75 (shipHull (combatEnemy fired))
-  assertEqual "player reload set" reloadTicks (shipReload (combatPlayer fired))
+testDuelStartsWithNoFiringState :: IO ()
+testDuelStartsWithNoFiringState = do
+  assertEqual "duel player starts with no locked target" Nothing (shipLockedTarget (combatPlayer caravelaDuel))
+  assertEqual "duel player starts with its guns not permitted to fire" False (shipFirePermission (combatPlayer caravelaDuel))
+  assertEqual "duel enemy starts with no locked target" Nothing (shipLockedTarget (combatEnemy caravelaDuel))
+  assertEqual "duel enemy starts with its guns not permitted to fire" False (shipFirePermission (combatEnemy caravelaDuel))
+
+testLockCommandTogglesTheLockedTarget :: IO ()
+testLockCommandTogglesTheLockedTarget = do
+  let
+    locked = tickCombat [Lock PlayerShip EnemyShip] caravelaDuel
+    unlocked = tickCombat [Lock PlayerShip EnemyShip] locked
+    enemyLocked = tickCombat [Lock EnemyShip PlayerShip] caravelaDuel
+  assertEqual "a lock names a single target" (Just EnemyShip) (shipLockedTarget (combatPlayer locked))
+  assertEqual "the same command against the locked target releases it" Nothing (shipLockedTarget (combatPlayer unlocked))
+  assertEqual "one ship's lock is not the other's" Nothing (shipLockedTarget (combatEnemy locked))
+  assertEqual "the enemy locks through the same command" (Just PlayerShip) (shipLockedTarget (combatEnemy enemyLocked))
+  assertEqual "locking grants no permission to fire" False (shipFirePermission (combatPlayer locked))
+
+testSelfLockIsRefusedAndLeavesTheLockAlone :: IO ()
+testSelfLockIsRefusedAndLeavesTheLockAlone = do
+  let
+    lockedOnEnemy = tickCombat [Lock PlayerShip EnemyShip] caravelaDuel
+    attemptedFromUnlocked = tickCombat [Lock PlayerShip PlayerShip] caravelaDuel
+    attemptedFromLocked = tickCombat [Lock PlayerShip PlayerShip] lockedOnEnemy
+  assertEqual "a ship may not lock itself" (TargetIsSelf PlayerShip) (canLockTarget caravelaDuel PlayerShip PlayerShip)
+  assertEqual "a refused self-lock acquires no lock" Nothing (shipLockedTarget (combatPlayer attemptedFromUnlocked))
+  assertEqual "a refused self-lock does not release the target already held" (Just EnemyShip) (shipLockedTarget (combatPlayer attemptedFromLocked))
+
+testLockOnAShipOutsideTheScenarioIsRefused :: IO ()
+testLockOnAShipOutsideTheScenarioIsRefused = do
+  let
+    -- Membership is read from the ships the scenario carries, so a state whose
+    -- hulls both answer to the player's id has no enemy to point a lock at.
+    withoutEnemy =
+      caravelaDuel
+        { combatEnemy = (combatEnemy caravelaDuel) { shipId = PlayerShip }
+        }
+    attempted = tickCombat [Lock PlayerShip EnemyShip] withoutEnemy
+  assertEqual
+    "a lock on a ship the scenario does not carry is refused"
+    (TargetNotInScenario EnemyShip)
+    (canLockTarget withoutEnemy PlayerShip EnemyShip)
+  assertEqual "a refused lock is not stored" Nothing (shipLockedTarget (combatPlayer attempted))
+
+testFireAtWillIsIndependentOfTheLock :: IO ()
+testFireAtWillIsIndependentOfTheLock = do
+  let
+    permitted = tickCombat [SetFireAtWill PlayerShip True] caravelaDuel
+    withdrawn = tickCombat [SetFireAtWill PlayerShip False] permitted
+    lockedOnly = tickCombat [Lock PlayerShip EnemyShip] caravelaDuel
+    lockedAndWithdrawn = tickCombat [SetFireAtWill PlayerShip False] lockedOnly
+  assertEqual "fire at will is granted without a locked target" True (shipFirePermission (combatPlayer permitted))
+  assertEqual "granting fire at will locks nothing" Nothing (shipLockedTarget (combatPlayer permitted))
+  assertEqual "fire at will is withdrawn again" False (shipFirePermission (combatPlayer withdrawn))
+  assertEqual "withdrawing fire at will keeps the locked target" (Just EnemyShip) (shipLockedTarget (combatPlayer lockedAndWithdrawn))
+  assertEqual "the other ship's permission is untouched" False (shipFirePermission (combatEnemy permitted))
 
 testInvalidBroadsideRange :: IO ()
 testInvalidBroadsideRange = do
@@ -183,8 +239,6 @@ testInvalidBroadsideRange = do
               { shipPosition = Point {pointX = 0, pointY = broadsideRange + 50}
               }
         }
-    fired = tickCombat [FireBroadside PlayerShip EnemyShip Port] outOfRange
-  assertEqual "enemy hull unchanged out of range" 100 (shipHull (combatEnemy fired))
   case canFireBroadside outOfRange PlayerShip EnemyShip Port of
     TargetOutOfRange range ->
       if range > broadsideRange
@@ -202,8 +256,6 @@ testInvalidBroadsideArc = do
               { shipPosition = Point {pointX = 80, pointY = 0}
               }
         }
-    fired = tickCombat [FireBroadside PlayerShip EnemyShip Port] wrongArc
-  assertEqual "enemy hull unchanged outside arc" 100 (shipHull (combatEnemy fired))
   case canFireBroadside wrongArc PlayerShip EnemyShip Port of
     TargetOutsideFiringArc angle ->
       if angle > 45
@@ -211,30 +263,44 @@ testInvalidBroadsideArc = do
         else die "arc failure did not report an outside-arc angle"
     other -> die $ "expected TargetOutsideFiringArc, got " <> show other
 
-testReloadCooldown :: IO ()
-testReloadCooldown = do
+-- | The reload is the whole of the delay the firing model rests on, so it has to
+-- keep running on its own clock while the new fire-control state is set.
+testReloadCooldownIsUnaffectedByFiringStateCommands :: IO ()
+testReloadCooldownIsUnaffectedByFiringStateCommands = do
   let
-    fired = tickCombat [FireBroadside PlayerShip EnemyShip Port] caravelaDuel
-    blocked = tickCombat [FireBroadside PlayerShip EnemyShip Port] fired
-    cooledOnce = tickCombat [] fired
-    cooledTwice = tickCombat [] cooledOnce
-    readyAgain = tickCombat [] cooledTwice
-  assertEqual "second broadside blocked by reload" 75 (shipHull (combatEnemy blocked))
-  case canFireBroadside fired PlayerShip EnemyShip Port of
-    BroadsideReloading remaining -> assertEqual "reload remaining" reloadTicks remaining
+    -- Nothing fires in this issue, so the reload a volley would have started is
+    -- part of the fixture.
+    reloading =
+      caravelaDuel
+        { combatPlayer = (combatPlayer caravelaDuel) {shipReload = reloadTicks}
+        }
+    commanded =
+      tickCombat
+        [ Lock PlayerShip EnemyShip
+        , SetFireAtWill PlayerShip True
+        ]
+        reloading
+    uncommanded = tickCombat [] reloading
+    cooledOnce = tickCombat [] commanded
+    readyAgain = tickCombat [] cooledOnce
+  assertEqual "firing state commands leave the reload counter alone" (shipReload (combatPlayer uncommanded)) (shipReload (combatPlayer commanded))
+  assertEqual "a lock does not need loaded guns" (Just EnemyShip) (shipLockedTarget (combatPlayer commanded))
+  assertEqual "fire at will does not need loaded guns" True (shipFirePermission (combatPlayer commanded))
+  case canFireBroadside commanded PlayerShip EnemyShip Port of
+    BroadsideReloading remaining ->
+      assertEqual "a reloading ship reports its own remaining reload" (shipReload (combatPlayer commanded)) remaining
     other -> die $ "expected BroadsideReloading, got " <> show other
-  assertEqual "reload counts down once" 2 (shipReload (combatPlayer cooledOnce))
-  assertEqual "reload counts down twice" 1 (shipReload (combatPlayer cooledTwice))
+  assertEqual "reload counts down once" 1 (shipReload (combatPlayer cooledOnce))
   assertEqual "reload reaches ready" 0 (shipReload (combatPlayer readyAgain))
 
 testTerminalHullState :: IO ()
 testTerminalHullState = do
   let
-    almostDisabled =
-      caravelaDuel
-        { combatEnemy = (combatEnemy caravelaDuel) {shipHull = broadsideDamage}
-        }
-    finished = tickCombat [FireBroadside PlayerShip EnemyShip Port] almostDisabled
+    -- Nothing fires in this issue, so the disabling damage is part of the
+    -- fixture; the rule under test is what a disabled hull does to the tick.
+    disabledEnemy = applyBroadsideDamage (shipMaxHull (combatEnemy caravelaDuel)) (combatEnemy caravelaDuel)
+    almostDisabled = caravelaDuel {combatEnemy = disabledEnemy}
+    finished = tickCombat [] almostDisabled
     afterFinished = tickCombat [] finished
   assertEqual "enemy hull disabled" 0 (shipHull (combatEnemy finished))
   assertEqual "player wins when enemy disabled" (ScenarioFinished (Winner PlayerShip)) (combatStatus finished)
@@ -596,15 +662,21 @@ testStoppedNavigationOrderBuildsWay = do
   assertApprox "stopped navigation accelerates straight ahead" 0.25 (pointX (shipPosition player))
   assertApprox "stopped navigation has not turned before building way" 0 (headingDegrees (shipHeading player))
 
-testBroadsideKeepsActiveNavigationOrder :: IO ()
-testBroadsideKeepsActiveNavigationOrder = do
+testFiringStateCommandsKeepActiveNavigationOrder :: IO ()
+testFiringStateCommandsKeepActiveNavigationOrder = do
   let
     ordered = tickCombat [IssueNavigationOrder PlayerShip (Point 40 20)] caravelaDuel
-    fired = tickCombat [FireBroadside PlayerShip EnemyShip Port] ordered
-  orderBeforeFiring <- expectNavigationOrder "navigation order before broadside" (combatPlayer ordered)
-  orderAfterFiring <- expectNavigationOrder "navigation order after broadside" (combatPlayer fired)
-  assertEqual "broadside damages independently of navigation" 75 (shipHull (combatEnemy fired))
-  assertEqual "broadside does not mutate the active navigation order" orderBeforeFiring orderAfterFiring
+    commanded =
+      tickCombat
+        [ Lock PlayerShip EnemyShip
+        , SetFireAtWill PlayerShip True
+        ]
+        ordered
+  orderBefore <- expectNavigationOrder "navigation order before firing state commands" (combatPlayer ordered)
+  orderAfter <- expectNavigationOrder "navigation order after firing state commands" (combatPlayer commanded)
+  assertEqual "firing state commands do not mutate the active navigation order" orderBefore orderAfter
+  assertEqual "lock and fire at will still apply beside a navigation order" (Just EnemyShip) (shipLockedTarget (combatPlayer commanded))
+  assertEqual "fire at will still applies beside a navigation order" True (shipFirePermission (combatPlayer commanded))
 
 testDisabledShipsClearAndIgnoreNavigation :: IO ()
 testDisabledShipsClearAndIgnoreNavigation = do
@@ -743,20 +815,21 @@ testConfiguredBroadsideTuning = do
             ]
         }
     bigAtLongRange = configuredDefaultEngagement tunedConfig
+    bigTuning = broadsideTuningForShip tunedConfig (combatPlayer bigAtLongRange)
     bigAtShortRange =
       bigAtLongRange
         { combatEnemy = (combatEnemy bigAtLongRange) {shipPosition = Point 0 60}
         }
-    bigFired = tickConfiguredCombat tunedConfig [SetHeading PlayerShip (Heading 180), FireBroadside PlayerShip EnemyShip Port] bigAtShortRange
+    bigCommanded = tickConfiguredCombat tunedConfig [SetHeading PlayerShip (Heading 180)] bigAtShortRange
     smallAtLongRange =
       case configuredEngagement tunedConfig "small" "big" of
         Just state -> state
         Nothing -> error "validated combat config is missing a configured boat kind"
+    smallTuning = broadsideTuningForShip tunedConfig (combatPlayer smallAtLongRange)
     smallArcState =
       smallAtLongRange
         { combatEnemy = (combatEnemy smallAtLongRange) {shipPosition = Point (-30) 52}
         }
-    smallFired = tickConfiguredCombat tunedConfig [FireBroadside PlayerShip EnemyShip Port] smallAtLongRange
     bigArcState =
       bigAtShortRange
         { combatEnemy = (combatEnemy bigAtShortRange) {shipPosition = Point (-30) 52}
@@ -764,12 +837,13 @@ testConfiguredBroadsideTuning = do
   case canFireBroadsideWith (broadsideTuningForShip tunedConfig) bigAtLongRange PlayerShip EnemyShip Port of
     TargetOutOfRange _ -> pure ()
     other -> die $ "configured big range: expected TargetOutOfRange, got " <> show other
-  assertEqual "configured big damage" 49 (shipHull (combatEnemy bigFired))
-  assertEqual "configured big reload" 4 (shipReload (combatPlayer bigFired))
-  assertApprox "configured heading intent does not replace physical heading for broadside" 0 (headingDegrees (shipHeading (combatPlayer bigFired)))
+  assertApprox "configured big range" 70 (broadsideTuningRange bigTuning)
+  assertEqual "configured big damage" 31 (broadsideTuningDamage bigTuning)
+  assertEqual "configured big reload" 4 (broadsideTuningReloadTicks bigTuning)
+  assertApprox "configured heading intent does not replace physical heading for broadside" 0 (headingDegrees (shipHeading (combatPlayer bigCommanded)))
   assertEqual "configured small range differs from big" BroadsideReady (canFireBroadsideWith (broadsideTuningForShip tunedConfig) smallAtLongRange PlayerShip EnemyShip Port)
-  assertEqual "configured small damage" 147 (shipHull (combatEnemy smallFired))
-  assertEqual "configured small reload" 1 (shipReload (combatPlayer smallFired))
+  assertEqual "configured small damage" 13 (broadsideTuningDamage smallTuning)
+  assertEqual "configured small reload" 1 (broadsideTuningReloadTicks smallTuning)
   assertEqual "configured small firing arc differs from big" BroadsideReady (canFireBroadsideWith (broadsideTuningForShip tunedConfig) smallArcState PlayerShip EnemyShip Port)
   case canFireBroadsideWith (broadsideTuningForShip tunedConfig) bigArcState PlayerShip EnemyShip Port of
     TargetOutsideFiringArc _ -> pure ()
@@ -781,26 +855,50 @@ testConfiguredBroadsideTuning = do
       "small" -> boat {boatConfigBroadsideRange = 100, boatConfigBroadsideDamage = 13, boatConfigReloadTicks = 1, boatConfigFiringArcDegrees = 45}
       _ -> boat
 
-testConfiguredLocalApiBroadsideTuning :: IO ()
-testConfiguredLocalApiBroadsideTuning = do
-  config <- expectRight "load packaged config for API broadside tuning" =<< loadRuntimeCombatConfig
+-- | A ship built from a boat config is armed the way every other ship starts:
+-- no locked target and no permission to fire.
+testConfiguredEngagementStartsWithNoFiringState :: IO ()
+testConfiguredEngagementStartsWithNoFiringState = do
+  config <- expectRight "load packaged config for initial firing state" =<< loadRuntimeCombatConfig
+  let engagement = configuredDefaultEngagement config
+  assertEqual "configured player starts with no locked target" Nothing (shipLockedTarget (combatPlayer engagement))
+  assertEqual "configured player starts with its guns not permitted to fire" False (shipFirePermission (combatPlayer engagement))
+  assertEqual "configured enemy starts with no locked target" Nothing (shipLockedTarget (combatEnemy engagement))
+  assertEqual "configured enemy starts with its guns not permitted to fire" False (shipFirePermission (combatEnemy engagement))
+
+-- | A hot reload refreshes what the boat kind owns. The lock and the permission
+-- belong to the live ship, so neither may be reset by it.
+testHotReloadKeepsLockAndFirePermission :: IO ()
+testHotReloadKeepsLockAndFirePermission = do
+  config <- expectRight "load packaged config for firing state hot reload" =<< loadRuntimeCombatConfig
   let
-    tunedConfig =
-      config
-        { combatConfigBoats =
-            [ boat {boatConfigBroadsideDamage = 31, boatConfigReloadTicks = 4}
-            | boat <- combatConfigBoats config
-            ]
+    engagement = configuredDefaultEngagement config
+    live =
+      engagement
+        { combatPlayer =
+            (combatPlayer engagement)
+              { shipLockedTarget = Just EnemyShip
+              , shipFirePermission = True
+              , shipReload = reloadTicks
+              }
         }
-  localApi <- newConfiguredLocalCombatApi tunedConfig
-  let api = localCombatApi localApi
-  _ <- expectRight "start configured scenario for API broadside tuning" =<< combatApiStartScenario api caravelaDuelScenarioId
-  _ <- queueLocalCommand "queue configured API broadside" api (FireBroadside PlayerShip EnemyShip Port)
-  snapshot <- advanceLocalApiTick "advance configured API broadside" api
-  player <- expectShipSnapshot "configured API broadside player" PlayerShip snapshot
-  enemy <- expectShipSnapshot "configured API broadside enemy" EnemyShip snapshot
-  assertEqual "configured API damage" 49 (shipSnapshotHull enemy)
-  assertEqual "configured API reload snapshot" 4 (shipSnapshotReload player)
+    reloaded = applyConfigToCombatState (withBigHull 200 config) live
+    player = combatPlayer reloaded
+    enemy = combatEnemy reloaded
+  assertEqual "hot reload keeps the locked target" (Just EnemyShip) (shipLockedTarget player)
+  assertEqual "hot reload keeps fire permission" True (shipFirePermission player)
+  assertEqual "hot reload does not touch the reload counter" reloadTicks (shipReload player)
+  assertEqual "hot reload still refreshes values the boat kind owns" 200 (shipMaxHull player)
+  assertEqual "an unlocked ship stays unlocked across a hot reload" Nothing (shipLockedTarget enemy)
+  assertEqual "a disengaged ship stays disengaged across a hot reload" False (shipFirePermission enemy)
+ where
+  withBigHull hull currentConfig =
+    currentConfig
+      { combatConfigBoats =
+          [ if boatConfigId boat == "big" then boat {boatConfigMaxHull = hull} else boat
+          | boat <- combatConfigBoats currentConfig
+          ]
+      }
 
 testConfiguredMovementSnapshot :: IO ()
 testConfiguredMovementSnapshot = do
@@ -828,8 +926,8 @@ testConfiguredLocalApiHotReloadsLiveEngagement = do
   let api = localCombatApi localApi
   _ <- expectRight "start configured scenario before hot reload" =<< combatApiStartScenario api caravelaDuelScenarioId
   _ <- queueLocalCommand "queue player heading before hot reload" api (SetHeading PlayerShip (Heading 90))
-  _ <- queueLocalCommand "queue player broadside before hot reload" api (FireBroadside PlayerShip EnemyShip Port)
-  _ <- queueLocalCommand "queue enemy broadside before hot reload" api (FireBroadside EnemyShip PlayerShip Port)
+  _ <- queueLocalCommand "queue player lock before hot reload" api (Lock PlayerShip EnemyShip)
+  _ <- queueLocalCommand "queue player fire at will before hot reload" api (SetFireAtWill PlayerShip True)
   beforeReload <- advanceLocalApiTick "advance configured scenario before hot reload" api
   playerBefore <- expectShipSnapshot "player before hot reload" PlayerShip beforeReload
   enemyBefore <- expectShipSnapshot "enemy before hot reload" EnemyShip beforeReload
@@ -847,25 +945,20 @@ testConfiguredLocalApiHotReloadsLiveEngagement = do
   assertEqual "hot reload keeps player target heading" (shipSnapshotTargetHeading playerBefore) (shipSnapshotTargetHeading playerAfter)
   assertApprox "hot reload keeps player speed" (shipSnapshotCurrentSpeed playerBefore) (shipSnapshotCurrentSpeed playerAfter)
   assertEqual "hot reload keeps player reload" (shipSnapshotReload playerBefore) (shipSnapshotReload playerAfter)
-  assertEqual "hot reload recalculates big hull from damage" 175 (shipSnapshotHull playerAfter)
+  assertEqual "hot reload keeps the player's locked target" (shipSnapshotLockedTarget playerBefore) (shipSnapshotLockedTarget playerAfter)
+  assertEqual "hot reload keeps the player's fire permission" (shipSnapshotFirePermission playerBefore) (shipSnapshotFirePermission playerAfter)
+  assertEqual "hot reload keeps the enemy's locked target" (shipSnapshotLockedTarget enemyBefore) (shipSnapshotLockedTarget enemyAfter)
+  assertEqual "hot reload keeps the enemy's fire permission" (shipSnapshotFirePermission enemyBefore) (shipSnapshotFirePermission enemyAfter)
   assertEqual "hot reload updates big max hull" 200 (shipSnapshotMaxHull playerAfter)
   assertApprox "hot reload updates big length" 22 (shipSnapshotRenderedLength playerAfter)
   assertApprox "hot reload updates big width" 9 (shipSnapshotRenderedWidth playerAfter)
-  assertEqual "hot reload recalculates small hull from damage" 45 (shipSnapshotHull enemyAfter)
+  assertEqual "hot reload updates a fresh hull to the new maximum" 200 (shipSnapshotHull playerAfter)
   assertEqual "hot reload updates small max hull" 70 (shipSnapshotMaxHull enemyAfter)
+  assertEqual "hot reload updates small hull to its new maximum" 70 (shipSnapshotHull enemyAfter)
   assertEqual "hot reload keeps enemy reload" (shipSnapshotReload enemyBefore) (shipSnapshotReload enemyAfter)
   advanced <- advanceLocalApiTick "advance using reloaded movement values" api
   advancedPlayer <- expectShipSnapshot "player after reloaded movement" PlayerShip advanced
   assertApprox "hot reload uses new tick seconds and acceleration" 4 (shipSnapshotCurrentSpeed advancedPlayer)
-  replicateM_ 2 $ do
-    _ <- advanceLocalApiTick "cool down after hot reload" api
-    pure ()
-  _ <- queueLocalCommand "queue player broadside after hot reload" api (FireBroadside PlayerShip EnemyShip Port)
-  fired <- advanceLocalApiTick "fire using reloaded broadside tuning" api
-  firedPlayer <- expectShipSnapshot "player after reloaded broadside" PlayerShip fired
-  firedEnemy <- expectShipSnapshot "enemy after reloaded broadside" EnemyShip fired
-  assertEqual "hot reload uses new broadside damage" 5 (shipSnapshotHull firedEnemy)
-  assertEqual "hot reload uses new broadside reload" 6 (shipSnapshotReload firedPlayer)
  where
   tuneForHotReload currentConfig =
     currentConfig
@@ -881,9 +974,6 @@ testConfiguredLocalApiHotReloadsLiveEngagement = do
           , boatConfigRenderedWidth = 9
           , boatConfigBattleSpeed = 4
           , boatConfigAcceleration = 5
-          , boatConfigBroadsideRange = 110
-          , boatConfigBroadsideDamage = 40
-          , boatConfigReloadTicks = 6
           }
       "small" -> boat {boatConfigMaxHull = 70}
       _ -> boat
@@ -942,26 +1032,27 @@ testInvalidReloadKeepsLastValidConfigAndSnapshot = do
   assertInvalidReloadPreservesLiveEngagement "semantic reload" localApi config beforeReload semantic
   assertInvalidReloadPreservesLiveEngagement "missing reload" localApi config beforeReload missing
 
+-- | The damage taken is what a hull reload recomputes the current hull from, so
+-- it has to survive a clamp down and back up. Nothing fires in this issue, so
+-- the damage is applied to the fixture with the domain's own accounting.
 testHotReloadPreservesDamageAcrossHullClamp :: IO ()
 testHotReloadPreservesDamageAcrossHullClamp = do
   config <- expectRight "load packaged config for repeated hull reload" =<< loadRuntimeCombatConfig
-  localApi <- newConfiguredLocalCombatApi config
-  let api = localCombatApi localApi
-  _ <- expectRight "start configured scenario before hull reload" =<< combatApiStartScenario api caravelaDuelScenarioId
-  _ <- queueLocalCommand "queue enemy damage before hull reload" api (FireBroadside EnemyShip PlayerShip Port)
-  damaged <- advanceLocalApiTick "apply enemy damage before hull reload" api
-  damagedPlayer <- expectShipSnapshot "player damaged before hull reload" PlayerShip damaged
-  assertEqual "broadside records player damage" 135 (shipSnapshotHull damagedPlayer)
-  localCombatApiReloadConfig localApi (withBigHull 20 config)
-  clamped <- expectRight "observe player after clamping hull reload" =<< combatApiObserveSnapshot api
-  clampedPlayer <- expectShipSnapshot "player after clamping hull reload" PlayerShip clamped
-  assertEqual "lower max hull clamps current hull" 0 (shipSnapshotHull clampedPlayer)
-  assertEqual "lower max hull is visible" 20 (shipSnapshotMaxHull clampedPlayer)
-  localCombatApiReloadConfig localApi (withBigHull 200 config)
-  restored <- expectRight "observe player after raised hull reload" =<< combatApiObserveSnapshot api
-  restoredPlayer <- expectShipSnapshot "player after raised hull reload" PlayerShip restored
-  assertEqual "raised max hull preserves original broadside damage" 175 (shipSnapshotHull restoredPlayer)
-  assertEqual "raised max hull is visible" 200 (shipSnapshotMaxHull restoredPlayer)
+  let
+    engagement = configuredDefaultEngagement config
+    damaged =
+      engagement
+        { combatPlayer = applyBroadsideDamage 25 (combatPlayer engagement)
+        }
+    clamped = applyConfigToCombatState (withBigHull 20 config) damaged
+    restored = applyConfigToCombatState (withBigHull 200 config) damaged
+    clampedPlayer = combatPlayer clamped
+    restoredPlayer = combatPlayer restored
+  assertEqual "a volley records player damage against the hull" 135 (shipHull (combatPlayer damaged))
+  assertEqual "lower max hull clamps current hull" 0 (shipHull clampedPlayer)
+  assertEqual "lower max hull is visible" 20 (shipMaxHull clampedPlayer)
+  assertEqual "raised max hull preserves original broadside damage" 175 (shipHull restoredPlayer)
+  assertEqual "raised max hull is visible" 200 (shipMaxHull restoredPlayer)
  where
   withBigHull hull currentConfig =
     currentConfig
@@ -1031,51 +1122,66 @@ testSetupDebugOverlayState = do
 testLocalApiQueuesCommandsUntilTick :: IO ()
 testLocalApiQueuesCommandsUntilTick = do
   (api, _) <- startLocalDuel
-  queuedSnapshot <- queueLocalCommand "queue local broadside" api (FireBroadside PlayerShip EnemyShip Port)
-  queuedEnemy <- expectShipSnapshot "queued enemy snapshot" EnemyShip queuedSnapshot
+  queuedSnapshot <- queueLocalCommand "queue local lock" api (Lock PlayerShip EnemyShip)
+  queuedPlayer <- expectShipSnapshot "queued player snapshot" PlayerShip queuedSnapshot
   observedSnapshot <- expectRight "observe queued scenario" =<< combatApiObserveSnapshot api
-  observedEnemy <- expectShipSnapshot "observed enemy snapshot" EnemyShip observedSnapshot
+  observedPlayer <- expectShipSnapshot "observed player snapshot" PlayerShip observedSnapshot
   advancedSnapshot <- advanceLocalApiTick "advance queued command" api
   advancedPlayer <- expectShipSnapshot "advanced player snapshot" PlayerShip advancedSnapshot
-  advancedEnemy <- expectShipSnapshot "advanced enemy snapshot" EnemyShip advancedSnapshot
   assertEqual "queued command does not advance tick" 0 (combatSnapshotTick queuedSnapshot)
-  assertEqual "queued command does not damage immediately" 100 (shipSnapshotHull queuedEnemy)
-  assertEqual "observe hides pending command mutation" 100 (shipSnapshotHull observedEnemy)
+  assertEqual "queued lock is not applied immediately" Nothing (shipSnapshotLockedTarget queuedPlayer)
+  assertEqual "observe hides the pending command" Nothing (shipSnapshotLockedTarget observedPlayer)
   assertEqual "advance increments tick" 1 (combatSnapshotTick advancedSnapshot)
-  assertEqual "advance applies broadside damage" 75 (shipSnapshotHull advancedEnemy)
-  assertEqual "advance exposes reload" reloadTicks (shipSnapshotReload advancedPlayer)
+  assertEqual "advance applies the queued lock" (Just EnemyShip) (shipSnapshotLockedTarget advancedPlayer)
 
-testLocalApiReportsTerminalState :: IO ()
-testLocalApiReportsTerminalState = do
-  (api, _) <- startLocalDuel
-  _ <- queueLocalCommand "queue player furl sails" api (SetSails PlayerShip SailsFurled)
-  _ <- queueLocalCommand "queue enemy furl sails" api (SetSails EnemyShip SailsFurled)
-  firstShot <- firePlayerPortBroadside api
-  assertEnemyHull "first API broadside" 75 firstShot
-  coolDownPlayerReload api
-  secondShot <- firePlayerPortBroadside api
-  assertEnemyHull "second API broadside" 50 secondShot
-  coolDownPlayerReload api
-  thirdShot <- firePlayerPortBroadside api
-  assertEnemyHull "third API broadside" 25 thirdShot
-  coolDownPlayerReload api
-  finalShot <- firePlayerPortBroadside api
-  afterFinished <- advanceLocalApiTick "advance finished local scenario" api
-  assertEnemyHull "final API broadside" 0 finalShot
-  assertEqual "API reports player victory" (ScenarioFinished (Winner PlayerShip)) (combatSnapshotStatus finalShot)
-  assertEqual "finished API scenario no longer advances" (combatSnapshotTick finalShot) (combatSnapshotTick afterFinished)
-  assertEqual "finished API snapshot remains terminal" (combatSnapshotStatus finalShot) (combatSnapshotStatus afterFinished)
+-- | Both commands are read-model state, and the local API is where the client
+-- meets them.
+testLocalApiExposesLockedTargetAndFirePermission :: IO ()
+testLocalApiExposesLockedTargetAndFirePermission = do
+  (api, snapshot) <- startLocalDuel
+  playerAtStart <- expectShipSnapshot "duel player at start" PlayerShip snapshot
+  assertEqual "a fresh duel ship reports no locked target" Nothing (shipSnapshotLockedTarget playerAtStart)
+  assertEqual "a fresh duel ship reports no permission to fire" False (shipSnapshotFirePermission playerAtStart)
+  _ <- queueLocalCommand "queue player lock" api (Lock PlayerShip EnemyShip)
+  _ <- queueLocalCommand "queue player fire at will" api (SetFireAtWill PlayerShip True)
+  locked <- advanceLocalApiTick "advance queued lock and fire at will" api
+  lockedPlayer <- expectShipSnapshot "locked player snapshot" PlayerShip locked
+  lockedEnemy <- expectShipSnapshot "locked enemy snapshot" EnemyShip locked
+  assertEqual "the lock command reaches the snapshot" (Just EnemyShip) (shipSnapshotLockedTarget lockedPlayer)
+  assertEqual "the fire at will command reaches the snapshot" True (shipSnapshotFirePermission lockedPlayer)
+  assertEqual "an unlocked ship still reports no locked target" Nothing (shipSnapshotLockedTarget lockedEnemy)
+  assertEqual "an unarmed ship still reports no permission to fire" False (shipSnapshotFirePermission lockedEnemy)
+  _ <- queueLocalCommand "queue player unlock" api (Lock PlayerShip EnemyShip)
+  _ <- queueLocalCommand "queue player hold fire" api (SetFireAtWill PlayerShip False)
+  released <- advanceLocalApiTick "advance queued unlock and hold fire" api
+  releasedPlayer <- expectShipSnapshot "released player snapshot" PlayerShip released
+  assertEqual "the same command through the API releases the lock" Nothing (shipSnapshotLockedTarget releasedPlayer)
+  assertEqual "withdrawing fire at will reaches the snapshot" False (shipSnapshotFirePermission releasedPlayer)
 
-firePlayerPortBroadside :: CombatApi IO -> IO CombatSnapshot
-firePlayerPortBroadside api = do
-  _ <- queueLocalCommand "queue player port broadside" api (FireBroadside PlayerShip EnemyShip Port)
-  advanceLocalApiTick "advance player port broadside" api
-
-coolDownPlayerReload :: CombatApi IO -> IO ()
-coolDownPlayerReload api =
-  replicateM_ reloadTicks $ do
-    _ <- advanceLocalApiTick "cool down player reload" api
-    pure ()
+-- | @shipFromSnapshot@ is the return leg of the read model, so a field that only
+-- travels one way is a field the round trip silently drops.
+testSnapshotCarriesLockedTargetAndFirePermission :: IO ()
+testSnapshotCarriesLockedTargetAndFirePermission = do
+  let
+    locked =
+      caravelaDuel
+        { combatPlayer =
+            (combatPlayer caravelaDuel)
+              { shipLockedTarget = Just EnemyShip
+              , shipFirePermission = True
+              }
+        }
+    snapshot = combatSnapshotFromState caravelaDuelScenario locked
+  player <- expectShipSnapshot "locked player snapshot" PlayerShip snapshot
+  enemy <- expectShipSnapshot "unlocked enemy snapshot" EnemyShip snapshot
+  assertEqual "snapshot exposes the locked target" (Just EnemyShip) (shipSnapshotLockedTarget player)
+  assertEqual "snapshot exposes fire permission" True (shipSnapshotFirePermission player)
+  assertEqual "snapshot exposes an unlocked ship" Nothing (shipSnapshotLockedTarget enemy)
+  assertEqual "snapshot exposes a disengaged ship" False (shipSnapshotFirePermission enemy)
+  assertEqual "snapshot round trip reconstructs the locked ship" (combatPlayer locked) (shipFromSnapshot player)
+  assertEqual "snapshot round trip reconstructs the unlocked ship" (combatEnemy locked) (shipFromSnapshot enemy)
+  assertEqual "snapshot round trip keeps the locked target" (Just EnemyShip) (shipLockedTarget (shipFromSnapshot player))
+  assertEqual "snapshot round trip keeps fire permission" True (shipFirePermission (shipFromSnapshot player))
 
 testInitialBattleRenderScene :: IO ()
 testInitialBattleRenderScene = do
@@ -1590,11 +1696,6 @@ assertMesh label expectedName expectedPosition expectedRotation expectedScale ex
   assertColor (label <> " color") expectedColor (materialColor (renderMeshMaterial mesh))
  where
   meshTransform = renderMeshTransform mesh
-
-assertEnemyHull :: String -> Int -> CombatSnapshot -> IO ()
-assertEnemyHull label expected snapshot = do
-  enemy <- expectShipSnapshot label EnemyShip snapshot
-  assertEqual label expected (shipSnapshotHull enemy)
 
 expectBoatConfig :: String -> Text -> CombatConfig -> IO BoatConfig
 expectBoatConfig label boatId config =
