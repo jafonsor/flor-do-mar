@@ -79,6 +79,49 @@ suspect the seam rather than the sweep size. Assert on the user-visible symptom
 (a tick that stops advancing, a main thread that stalls) somewhere that can
 actually observe it.
 
+## A half-drawn canvas is not a missing scene
+
+The battle canvas sometimes showed the trajectory strokes and speed rings with no
+ship hulls, heading markers or target markers in them. The obvious reading — the
+snapshot or the scene lost its ships, so instrument the FRP graph — is wrong, and
+so is the layer it points at.
+
+The scene was always complete. Every render issued exactly six unit-cube draws
+(measured: 1272 over 212 renders), and one flickering frame also drew the player's
+*hover* overlay, which is derived from the player's own entry in the same snapshot:
+a scene that had lost the player's ship could not have drawn it.
+
+What was missing was the canvas, not the scene. `renderScene` issued one jsaddle
+round trip per WebGL call, so a render was dozens of browser tasks and the
+compositor could present the canvas between any two of them. A canvas created
+without `preserveDrawingBuffer` is cleared once it has been presented, so whatever
+had been drawn before that boundary was wiped — and the ships are the first six
+primitives of the draw order, which is why they are the part that vanishes while
+strokes and rings, drawn after the boundary, survive. Frames are atomic now
+([ADR-0007](../../docs/adr/0007-one-browser-task-per-frame.md)); this is kept
+because the symptom points confidently at the wrong layer.
+
+`cdp-canvas-flicker.mjs` is the gate, and `--preserve` is the one-variable check:
+forcing `preserveDrawingBuffer: true` from the browser side, with no rebuild and no
+client restart, turned a session that spent 4.8% of its time with no boats on the
+canvas into one that spent 0%:
+
+```bash
+node .scratch/diagnosis/cdp-canvas-flicker.mjs 6 6              # RED, 4.8% without boats
+node .scratch/diagnosis/cdp-canvas-flicker.mjs 6 6 --preserve   # GREEN, 0%
+```
+
+Two habits follow:
+
+- When something *drawn* is absent from the screen, ask what the canvas was told to
+  draw before doubting what the scene contained. The draw calls are cheap to count;
+  a scene is not cheap to doubt.
+- A gate has to tell "nothing was drawn" apart from "everything was drawn
+  correctly". The first green run of this harness had drawn zero frames — its
+  executor threw on every render — because a page with no frames is also a page with
+  no frame *missing* the boats. It now fails fast on a page that never drew, and
+  refuses a verdict without evidence.
+
 ## Driving the client in a browser
 
 The client is a native Haskell server on **port 3911** that drives the browser over
@@ -92,7 +135,7 @@ cabal run -v0 flor-do-mar-client            # serves http://localhost:3911/
   --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader
 ```
 
-Two traps, plus one sandbox note:
+Two traps, plus two sandbox notes:
 
 - **Headless Chrome has no WebGL without the SwiftShader flags.** With plain
   `--disable-gpu`, `getContext('webgl')` returns null, the app logs
@@ -104,24 +147,55 @@ Two traps, plus one sandbox note:
   the app's own state text, which the client renders as
   `Tick N | <scenario> | Player | Hull … | Enemy | Hull … | Engagement | Range …`.
   That text is the cheapest ground truth for "did the simulation actually progress".
-- **Under a restricted workspace sandbox, pass a repo-local `--user-data-dir` and
-  `TMPDIR`.** Chromium refuses to start when it cannot create its
-  process-singleton socket and crashpad directory, and it exits 21 with
-  `Failed to create a ProcessSingleton for your profile directory` rather than
-  anything that names the sandbox. Pointing both at `.scratch/diagnosis/` (or
-  escalating) is what unblocks it.
+  When the *pixels* are what is in question, `cdp-canvas-picture.mjs` captures them
+  reliably by asking the canvas from a microtask queued inside the frame's own task
+  — see *A half-drawn canvas is not a missing scene* above.
+- **The repo-local `--user-data-dir` and `TMPDIR` workaround is not always enough
+  (Chrome 153).** Redirecting both is the first thing to try, but Chrome still
+  aborted with `Failed to create socket directory` /
+  `Failed to create a ProcessSingleton for your profile directory`, and crashpad
+  still logged `Operation not permitted` for
+  `~/Library/Application Support/Google/Chrome/Crashpad/settings.dat`. With
+  `TMPDIR` under `.scratch/diagnosis/`, under `dist-newstyle/`, and as short as
+  `/tmp/fdm-tmp`, the failure was identical; the browser started only when the
+  launch itself was escalated out of the workspace-only sandbox. Budget for that
+  rather than re-deriving it — and re-check it on a Chrome upgrade, since it is
+  pinned to one.
+- **Every harness page holds a WebGL context, and Chrome stops handing them out.**
+  A run that leaves its page open can starve the next one: that page gets no
+  context, draws nothing, and any check that only asks "were the boats missing?"
+  reads as a pass. Close your own target on every exit path (as
+  `cdp-canvas-flicker.mjs` does) and use `cdp-close-pages.mjs` to clear up after a
+  harness that does not.
 
 Harnesses live in `.scratch/diagnosis/` and are worth reusing rather than
 rewriting. All give every CDP command a hard deadline, so a stalled page is a
 *result* rather than a hung script:
 
+- `cdp-canvas-flicker.mjs` — the gate for the render path. Patches the page's
+  `WebGLRenderingContext` before the app boots, records every `clear` and
+  `drawElements` with its vertex count, and reconstructs what each presented frame
+  contained. Red when a frame reaches the screen with strokes and rings but no ship
+  hulls; `--preserve` forces `preserveDrawingBuffer: true` from the browser side,
+  which is the one-variable check that the drawing buffer's post-present clear is
+  what loses them. Run it after any change to the renderer or the render scene.
+- `cdp-canvas-picture.mjs` — writes what the canvas actually shows to
+  `.scratch/diagnosis/canvas-picture.png`. Look at it after any change to the
+  renderer: the flicker gate asserts the boats are *drawn*, not that the picture is
+  right.
+- `cdp-close-pages.mjs` — closes leftover pages on the client's URL, for the WebGL
+  context limit above. Closing a page can, rarely, take the client process down —
+  see the disconnect defect in
+  [issue 01](../../.scratch/mesh-rendering-pipeline/issues/01-battle-canvas-frames-lose-the-boats.md).
 - `cdp-mainthread-cost.mjs` — the regression gate for render cost. Drives real
   pointer input at 60 Hz and asserts on Chrome's own `TaskDuration` delta per move,
   blocking sync-POST count, and long tasks. Run it after any change to the battle
   view, the renderer, or the input path.
 - `cdp-pointer-behaviour.mjs` — asserts the pointer path still behaves (a click
   issues an order, opposite canvas sides give opposite bearings, hover and
-  mouseleave leave a committed order alone, drag works).
+  mouseleave leave a committed order alone, drag works). Its last check, "enemy
+  keeps manoeuvring", samples headings for 5.4 s and can fail on a long straight
+  leg; confirm against a fresh page before calling it a regression.
 - `cdp-epoch-recovery.mjs` — the gate for the stale-page fix. Drives a page,
   replaces the client under it via `restart-3911.sh`, and asserts the page reloads
   itself and resumes ticking. Run it after any change to how the page is served.
@@ -129,6 +203,10 @@ rewriting. All give every CDP command a hard deadline, so a stalled page is a
   diagnosis harnesses for that freeze. The fire ones are controls: they showed
   that firing does *not* freeze a fresh page, which is what pointed the
   investigation at session lifetime instead.
+
+Start the client as a job that outlives the command that launched it. A client
+backgrounded from inside a tool call can be gone by the next one, and a dead client
+looks exactly like a page that never booted.
 
 ## Planner tests that use their own yaw acceleration can hide a hunting controller
 

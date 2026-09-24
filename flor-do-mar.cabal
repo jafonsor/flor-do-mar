@@ -54,6 +54,7 @@ executable flor-do-mar-client
     FlorDoMar.Client.BattleView
     FlorDoMar.Client.Render.Scene
     FlorDoMar.Client.WebGL.Camera
+    FlorDoMar.Client.WebGL.DrawBatch
     FlorDoMar.Client.WebGL.Geometry
     FlorDoMar.Client.WebGL.Math
     FlorDoMar.Client.WebGL.Renderer

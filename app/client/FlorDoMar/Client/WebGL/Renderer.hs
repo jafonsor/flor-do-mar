@@ -1,246 +1,267 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | The WebGL renderer: a frame is one call, not one call per GL command.
+--
+-- The browser owns the GL objects — program, uniform locations and per-primitive
+-- buffers — behind a small executor installed by 'batchExecutorSource'. Haskell
+-- owns the scene, the geometry and the decision about what needs uploading, and
+-- hands the browser one encoded 'DrawBatch' per frame. That single call is the
+-- whole point: it runs as one browser task, so no compositor frame can land in
+-- the middle of a render and present a canvas that is only half drawn.
 module FlorDoMar.Client.WebGL.Renderer
   ( Renderer
   , initRenderer
   , renderScene
-  )
-where
+  ) where
 
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
-import Data.Word (Word16)
+import Data.Text qualified as Text
 import FlorDoMar.Client.Render.Scene
-import FlorDoMar.Client.WebGL.Camera (Camera2D, camera2DMatrix)
+import FlorDoMar.Client.WebGL.Camera (camera2DMatrix)
+import FlorDoMar.Client.WebGL.DrawBatch
 import FlorDoMar.Client.WebGL.Geometry
-import FlorDoMar.Client.WebGL.Math
-  ( Mat4
-  , Scalar
-  , mat4ToColumnMajorList
-  , multiply4
-  )
+import FlorDoMar.Client.WebGL.Math (Scalar, multiply4)
 import Language.Javascript.JSaddle
 import Language.Javascript.JSaddle.Value qualified as JS
 
 data Renderer = Renderer
-  { rendererGl :: JSVal
-  , rendererProgram :: JSVal
-  , rendererPositionAttribute :: Int
-  , rendererMatrixUniform :: JSVal
-  , rendererColorUniform :: JSVal
-  , rendererGeometryCache :: IORef (Map Text CachedGeometry)
-  , rendererCanvasWidth :: Int
-  , rendererCanvasHeight :: Int
+  { rendererExecutor :: JSVal
+  -- ^ The browser-side executor, looked up once so a frame costs one call.
+  , rendererRender :: JSVal
+  -- ^ Its @render@ method, fetched once rather than per frame: a method lookup is
+  -- a round trip, and a frame is rendered up to once per animation frame.
+  , rendererHandle :: Int
+  -- ^ Which canvas the executor draws to.
+  , rendererUploadedGeometry :: IORef (Map Text Geometry3D)
+  -- ^ Geometry as the browser currently holds it, per primitive name. A primitive
+  -- whose geometry compares equal is not sent again.
   }
 
--- | A primitive's geometry as it currently exists on the GPU, kept so a redraw
--- can skip re-uploading geometry that has not changed.
-data CachedGeometry = CachedGeometry
-  { cachedGeometrySource :: Geometry3D
-  , cachedVertexBuffer :: JSVal
-  , cachedIndexBuffer :: JSVal
-  }
-
+-- | Build the program in the browser and return a renderer for it.
 initRenderer :: JSVal -> JSM (Maybe Renderer)
 initRenderer gl = do
-  vertexShaderMaybe <- createShader gl vertexShader vertexShaderSource
-  fragmentShaderMaybe <- createShader gl fragmentShader fragmentShaderSource
-  case (vertexShaderMaybe, fragmentShaderMaybe) of
-    (Just vertexShaderValue, Just fragmentShaderValue) -> do
-      programMaybe <- createProgram gl vertexShaderValue fragmentShaderValue
-      case programMaybe of
-        Nothing -> pure Nothing
-        Just program -> initializeRendererWithProgram gl program
-    _ -> pure Nothing
-
-renderScene :: Renderer -> RenderScene -> JSM ()
-renderScene renderer scene = do
-  let
-    gl = rendererGl renderer
-  void $ callMethod "viewport" gl (0 :: Int, 0 :: Int, rendererCanvasWidth renderer, rendererCanvasHeight renderer)
-  void $ callMethod "clearColor" gl (0.015 :: Double, 0.035 :: Double, 0.055 :: Double, 1 :: Double)
-  void $ callMethod "clearDepth" gl [1 :: Double]
-  void $ callMethod "clear" gl [colorBufferBit + depthBufferBit]
-  void $ callMethod "useProgram" gl [rendererProgram renderer]
-  void $ callMethod "enableVertexAttribArray" gl [rendererPositionAttribute renderer]
-  mapM_ (drawPrimitive renderer (renderSceneCamera scene)) (renderScenePrimitives scene)
-
-initializeRendererWithProgram :: JSVal -> JSVal -> JSM (Maybe Renderer)
-initializeRendererWithProgram gl program = do
-  positionAttributeValue <- callMethod "getAttribLocation" gl (program, "a_position" :: Text)
-  positionAttribute <- round <$> JS.valToNumber positionAttributeValue
-  matrixUniform <- callMethod "getUniformLocation" gl (program, "u_matrix" :: Text)
-  colorUniform <- callMethod "getUniformLocation" gl (program, "u_color" :: Text)
-  matrixUniformMaybe <- JS.maybeNullOrUndefined matrixUniform
-  colorUniformMaybe <- JS.maybeNullOrUndefined colorUniform
-  canvas <- gl ! ("canvas" :: Text)
-  canvasWidth <- round <$> (JS.valToNumber =<< canvas ! ("width" :: Text))
-  canvasHeight <- round <$> (JS.valToNumber =<< canvas ! ("height" :: Text))
-  case (positionAttribute >= 0, matrixUniformMaybe, colorUniformMaybe) of
-    (True, Just matrixUniformValue, Just colorUniformValue) -> do
-      void $ callMethod "useProgram" gl [program]
-      void $ callMethod "enable" gl [depthTest]
-      void $ callMethod "depthFunc" gl [lessEqual]
-      geometryCache <- liftIO $ newIORef Map.empty
+  void $ eval batchExecutorSource
+  executor <- jsg ("__fdmRenderer" :: Text)
+  created <- callMethod "create" executor (gl, vertexShaderSource, fragmentShaderSource)
+  succeeded <- JS.valToBool =<< created ! ("ok" :: Text)
+  if not succeeded
+    then do
+      message <- JS.valToText =<< created ! ("error" :: Text)
+      logWebGlError message
+      pure Nothing
+    else do
+      handle <- round <$> (JS.valToNumber =<< created ! ("handle" :: Text))
+      renderFunction <- executor ! ("render" :: Text)
+      uploadedGeometry <- liftIO $ newIORef Map.empty
       pure $
         Just
           Renderer
-            { rendererGl = gl
-            , rendererProgram = program
-            , rendererPositionAttribute = positionAttribute
-            , rendererMatrixUniform = matrixUniformValue
-            , rendererColorUniform = colorUniformValue
-            , rendererGeometryCache = geometryCache
-            , rendererCanvasWidth = canvasWidth
-            , rendererCanvasHeight = canvasHeight
+            { rendererExecutor = executor
+            , rendererRender = renderFunction
+            , rendererHandle = handle
+            , rendererUploadedGeometry = uploadedGeometry
             }
-    _ -> do
-      logWebGlError "Could not initialize WebGL renderer resources."
-      pure Nothing
 
-drawPrimitive :: Renderer -> Camera2D -> RenderPrimitive -> JSM ()
-drawPrimitive renderer camera primitive = do
-  let
-    geometry = renderPrimitiveGeometry primitive
-    matrix = camera2DMatrix camera `multiply4` renderPrimitiveWorldMatrix primitive
-    fill = materialColor (renderPrimitiveMaterial primitive)
-  bindGeometry renderer (renderPrimitiveName primitive) geometry
-  uploadMatrix (rendererGl renderer) (rendererMatrixUniform renderer) matrix
-  void $
-    callMethod
-      "uniform4f"
-      (rendererGl renderer)
-      ( rendererColorUniform renderer
-      , realToFrac (colorRed fill) :: Double
-      , realToFrac (colorGreen fill) :: Double
-      , realToFrac (colorBlue fill) :: Double
-      , realToFrac (colorAlpha fill) :: Double
-      )
-  void $
-    callMethod
-      "drawElements"
-      (rendererGl renderer)
-      (triangles, length (geometry3DIndices geometry), unsignedShort, 0 :: Int)
-
--- | Bind a primitive's buffers, uploading only when its geometry changed.
+-- | Draw one frame.
 --
--- Every render used to re-upload every primitive's vertices and indices through
--- jsaddle, which marshals a list one element per command: a single 48-segment
--- ring cost roughly 900 commands, and a pointer move re-rendered the whole
--- scene. The geometry is now compared before upload, so redrawing an unchanged
--- scene costs nothing. Most of the scene really is static between ticks — ship
--- bodies, heading markers and speed rings only change when the simulation does.
---
--- 'vertexAttribPointer' has to be re-issued per primitive because each one now
--- has its own buffers, and it records whichever buffer is bound at the time.
-bindGeometry :: Renderer -> Text -> Geometry3D -> JSM ()
-bindGeometry renderer name geometry = do
-  cached <- cachedGeometry renderer name geometry
-  let
-    gl = rendererGl renderer
-  void $ callMethod "bindBuffer" gl (arrayBuffer, cachedVertexBuffer cached)
-  void $ callMethod "bindBuffer" gl (elementArrayBuffer, cachedIndexBuffer cached)
+-- The upload cache is only advanced once the frame has been handed over, so a
+-- frame that fails to execute does not leave the browser holding geometry the
+-- renderer believes it has sent.
+renderScene :: Renderer -> RenderScene -> JSM ()
+renderScene renderer scene = do
+  uploaded <- liftIO $ readIORef (rendererUploadedGeometry renderer)
+  let (batch, uploadedAfter) = drawBatchForScene uploaded scene
   void $
-    callMethod
-      "vertexAttribPointer"
-      gl
-      (rendererPositionAttribute renderer, 3 :: Int, glFloat, False, 0 :: Int, 0 :: Int)
+    call
+      (rendererRender renderer)
+      (rendererExecutor renderer)
+      (rendererHandle renderer, encodeDrawBatch batch)
+  liftIO $ writeIORef (rendererUploadedGeometry renderer) uploadedAfter
 
-cachedGeometry :: Renderer -> Text -> Geometry3D -> JSM CachedGeometry
-cachedGeometry renderer name geometry = do
-  cache <- liftIO $ readIORef (rendererGeometryCache renderer)
-  case Map.lookup name cache of
-    Just cached
-      | cachedGeometrySource cached == geometry -> pure cached
-      | otherwise -> do
-          uploadGeometry renderer (cachedVertexBuffer cached) (cachedIndexBuffer cached) geometry
-          store cached { cachedGeometrySource = geometry }
-    Nothing -> do
-      vertexBuffer <- createBufferOrFail renderer
-      indexBuffer <- createBufferOrFail renderer
-      uploadGeometry renderer vertexBuffer indexBuffer geometry
-      store (CachedGeometry geometry vertexBuffer indexBuffer)
+-- | Collect a scene into the frame the browser will replay, and say what the
+-- browser holds afterwards.
+drawBatchForScene :: Map Text Geometry3D -> RenderScene -> (DrawBatch, Map Text Geometry3D)
+drawBatchForScene uploaded scene =
+  ( DrawBatch
+      { drawBatchClearColor = sceneClearColor
+      , drawBatchClearDepth = sceneClearDepth
+      , drawBatchPrimitives = reverse collectedPrimitives
+      }
+  , collectedGeometry
+  )
  where
-  store cached = do
-    liftIO $ modifyIORef' (rendererGeometryCache renderer) (Map.insert name cached)
-    pure cached
+  camera = renderSceneCamera scene
+  (collectedGeometry, collectedPrimitives) =
+    foldl collect (uploaded, []) (renderScenePrimitives scene)
 
--- | Reuse the entry's own buffers. Only the contents change, so the buffer
--- objects never need recreating.
-uploadGeometry :: Renderer -> JSVal -> JSVal -> Geometry3D -> JSM ()
-uploadGeometry renderer vertexBuffer indexBuffer geometry = do
-  let gl = rendererGl renderer
-  vertices <- float32Array (geometry3DPositions geometry)
-  indices <- uint16Array (geometry3DIndices geometry)
-  void $ callMethod "bindBuffer" gl (arrayBuffer, vertexBuffer)
-  void $ callMethod "bufferData" gl (arrayBuffer, vertices, staticDraw)
-  void $ callMethod "bindBuffer" gl (elementArrayBuffer, indexBuffer)
-  void $ callMethod "bufferData" gl (elementArrayBuffer, indices, staticDraw)
+  collect (known, primitives) primitive =
+    let
+      name = renderPrimitiveName primitive
+      geometry = renderPrimitiveGeometry primitive
+      changed = Map.lookup name known /= Just geometry
+     in
+      ( if changed then Map.insert name geometry known else known
+      , DrawBatchPrimitive
+          { drawBatchPrimitiveName = name
+          , drawBatchPrimitiveMatrix = camera2DMatrix camera `multiply4` renderPrimitiveWorldMatrix primitive
+          , drawBatchPrimitiveColor = materialColor (renderPrimitiveMaterial primitive)
+          , drawBatchPrimitiveGeometry = if changed then Just geometry else Nothing
+          }
+          : primitives
+      )
 
-createBufferOrFail :: Renderer -> JSM JSVal
-createBufferOrFail renderer = do
-  buffer <- callMethod "createBuffer" (rendererGl renderer) ()
-  JS.maybeNullOrUndefined buffer >>= \case
-    Nothing -> logWebGlError "Could not create a WebGL buffer."
-    Just _ -> pure ()
-  pure buffer
+sceneClearColor :: Color
+sceneClearColor = color 0.015 0.035 0.055 1
 
-uploadMatrix :: JSVal -> JSVal -> Mat4 -> JSM ()
-uploadMatrix gl location matrix = do
-  matrixArray <- float32Array (mat4ToColumnMajorList matrix)
-  void $ callMethod "uniformMatrix4fv" gl (location, False, matrixArray)
+sceneClearDepth :: Scalar
+sceneClearDepth = 1
 
-createShader :: JSVal -> Int -> Text -> JSM (Maybe JSVal)
-createShader gl shaderType source = do
-  shaderValue <- callMethod "createShader" gl [shaderType]
-  shaderMaybe <- JS.maybeNullOrUndefined shaderValue
-  case shaderMaybe of
-    Nothing -> pure Nothing
-    Just shader -> do
-      void $ callMethod "shaderSource" gl (shader, source)
-      void $ callMethod "compileShader" gl [shader]
-      compiled <- JS.valToBool =<< callMethod "getShaderParameter" gl (shader, compileStatus)
-      if compiled
-        then pure (Just shader)
-        else do
-          infoLog <- JS.valToText =<< callMethod "getShaderInfoLog" gl [shader]
-          logWebGlError ("Could not compile WebGL shader: " <> infoLog)
-          pure Nothing
-
-createProgram :: JSVal -> JSVal -> JSVal -> JSM (Maybe JSVal)
-createProgram gl vertexShaderValue fragmentShaderValue = do
-  programValue <- callMethod "createProgram" gl ()
-  programMaybe <- JS.maybeNullOrUndefined programValue
-  case programMaybe of
-    Nothing -> pure Nothing
-    Just program -> do
-      void $ callMethod "attachShader" gl (program, vertexShaderValue)
-      void $ callMethod "attachShader" gl (program, fragmentShaderValue)
-      void $ callMethod "linkProgram" gl [program]
-      linked <- JS.valToBool =<< callMethod "getProgramParameter" gl (program, linkStatus)
-      if linked
-        then pure (Just program)
-        else do
-          infoLog <- JS.valToText =<< callMethod "getProgramInfoLog" gl [program]
-          logWebGlError ("Could not link WebGL program: " <> infoLog)
-          pure Nothing
-
-float32Array :: [Scalar] -> JSM JSVal
-float32Array values = do
-  constructor <- jsg ("Float32Array" :: Text)
-  valuesArray <- JS.val (fmap realToFrac values :: [Double])
-  new constructor [valuesArray]
-
-uint16Array :: [Word16] -> JSM JSVal
-uint16Array values = do
-  constructor <- jsg ("Uint16Array" :: Text)
-  valuesArray <- JS.val (fmap fromIntegral values :: [Int])
-  new constructor [valuesArray]
+-- | The browser half of the renderer.
+--
+-- It is deliberately thin: it owns GL objects and replays the commands in the
+-- order it is given them, and knows nothing about ships, trajectories or the
+-- scene graph. Everything above it is Haskell.
+batchExecutorSource :: Text
+batchExecutorSource =
+  Text.unlines
+    [ "(function () {"
+    , "  if (window.__fdmRenderer) { return; }"
+    , "  var COLOR_BUFFER_BIT = 0x4000;"
+    , "  var DEPTH_BUFFER_BIT = 0x0100;"
+    , "  var states = [];"
+    , ""
+    , "  var compileShader = function (gl, type, source) {"
+    , "    var shader = gl.createShader(type);"
+    , "    if (!shader) { return { error: 'Could not initialize WebGL renderer resources.' }; }"
+    , "    gl.shaderSource(shader, source);"
+    , "    gl.compileShader(shader);"
+    , "    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {"
+    , "      return { error: 'Could not compile WebGL shader: ' + gl.getShaderInfoLog(shader) };"
+    , "    }"
+    , "    return { shader: shader };"
+    , "  };"
+    , ""
+    , "  var buildProgram = function (gl, vertexSource, fragmentSource) {"
+    , "    var vertexShader = compileShader(gl, gl.VERTEX_SHADER, vertexSource);"
+    , "    if (vertexShader.error) { return vertexShader; }"
+    , "    var fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, fragmentSource);"
+    , "    if (fragmentShader.error) { return fragmentShader; }"
+    , "    var program = gl.createProgram();"
+    , "    if (!program) { return { error: 'Could not initialize WebGL renderer resources.' }; }"
+    , "    gl.attachShader(program, vertexShader.shader);"
+    , "    gl.attachShader(program, fragmentShader.shader);"
+    , "    gl.linkProgram(program);"
+    , "    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {"
+    , "      return { error: 'Could not link WebGL program: ' + gl.getProgramInfoLog(program) };"
+    , "    }"
+    , "    return { program: program };"
+    , "  };"
+    , ""
+    , "  var create = function (gl, vertexSource, fragmentSource) {"
+    , "    try {"
+    , "      var built = buildProgram(gl, vertexSource, fragmentSource);"
+    , "      if (built.error) { return { ok: false, error: built.error }; }"
+    , "      var positionAttribute = gl.getAttribLocation(built.program, 'a_position');"
+    , "      var matrixUniform = gl.getUniformLocation(built.program, 'u_matrix');"
+    , "      var colorUniform = gl.getUniformLocation(built.program, 'u_color');"
+    , "      if (positionAttribute < 0 || matrixUniform === null || colorUniform === null) {"
+    , "        return { ok: false, error: 'Could not initialize WebGL renderer resources.' };"
+    , "      }"
+    , "      gl.useProgram(built.program);"
+    , "      gl.enable(gl.DEPTH_TEST);"
+    , "      gl.depthFunc(gl.LEQUAL);"
+    , "      states.push({"
+    , "        gl: gl,"
+    , "        program: built.program,"
+    , "        positionAttribute: positionAttribute,"
+    , "        matrixUniform: matrixUniform,"
+    , "        colorUniform: colorUniform,"
+    , "        buffers: {}"
+    , "      });"
+    , "      return { ok: true, handle: states.length - 1 };"
+    , "    } catch (error) {"
+    , "      return { ok: false, error: 'Could not initialize WebGL renderer: ' + error };"
+    , "    }"
+    , "  };"
+    , ""
+    , "  var primitiveBuffers = function (state, name) {"
+    , "    var buffers = state.buffers[name];"
+    , "    if (buffers) { return buffers; }"
+    , "    var gl = state.gl;"
+    , "    buffers = { vertex: gl.createBuffer(), index: gl.createBuffer(), indexCount: 0 };"
+    , "    if (!buffers.vertex || !buffers.index) {"
+    , "      console.error('Could not create a WebGL buffer.');"
+    , "    }"
+    , "    state.buffers[name] = buffers;"
+    , "    return buffers;"
+    , "  };"
+    , ""
+    , "  var drawPrimitive = function (state, primitive) {"
+    , "    var gl = state.gl;"
+    , "    var buffers = primitiveBuffers(state, primitive.name);"
+    , "    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.vertex);"
+    , "    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffers.index);"
+    , "    if (primitive.geometry) {"
+    , "      var indices = new Uint16Array(primitive.geometry.indices);"
+    , "      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(primitive.geometry.positions), gl.STATIC_DRAW);"
+    , "      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);"
+    , "      buffers.indexCount = indices.length;"
+    , "    }"
+    , "    gl.vertexAttribPointer(state.positionAttribute, 3, gl.FLOAT, false, 0, 0);"
+    , "    gl.uniformMatrix4fv(state.matrixUniform, false, new Float32Array(primitive.matrix));"
+    , "    gl.uniform4f("
+    , "      state.colorUniform,"
+    , "      primitive.color[0],"
+    , "      primitive.color[1],"
+    , "      primitive.color[2],"
+    , "      primitive.color[3]"
+    , "    );"
+    , "    gl.drawElements(gl.TRIANGLES, buffers.indexCount, gl.UNSIGNED_SHORT, 0);"
+    , "  };"
+    , ""
+    , "  // One call, one task: every command of a frame runs before the browser can"
+    , "  // present the canvas again."
+    , "  var render = function (handle, payload) {"
+    , "    try {"
+    , "      draw(handle, payload);"
+    , "    } catch (error) {"
+    , "      // Housekeeping only: an exception that escaped here would cross back"
+    , "      // into the widget and end the page's session, so a bad frame must not"
+    , "      // be allowed to take the client down with it."
+    , "      console.error('Could not render the draw batch: ' + error);"
+    , "    }"
+    , "  };"
+    , ""
+    , "  var draw = function (handle, payload) {"
+    , "    var state = states[handle];"
+    , "    if (!state) { return; }"
+    , "    var batch;"
+    , "    try {"
+    , "      batch = JSON.parse(payload);"
+    , "    } catch (error) {"
+    , "      console.error('Could not read the draw batch: ' + error);"
+    , "      return;"
+    , "    }"
+    , "    var gl = state.gl;"
+    , "    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);"
+    , "    gl.clearColor(batch.clear[0], batch.clear[1], batch.clear[2], batch.clear[3]);"
+    , "    gl.clearDepth(batch.depth);"
+    , "    gl.clear(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT);"
+    , "    gl.useProgram(state.program);"
+    , "    gl.enableVertexAttribArray(state.positionAttribute);"
+    , "    for (var i = 0; i < batch.primitives.length; i++) {"
+    , "      drawPrimitive(state, batch.primitives[i]);"
+    , "    }"
+    , "  };"
+    , ""
+    , "  window.__fdmRenderer = { create: create, render: render };"
+    , "})();"
+    ]
 
 callMethod :: (MakeArgs args) => Text -> JSVal -> args -> JSM JSVal
 callMethod method target args = do
@@ -267,45 +288,3 @@ fragmentShaderSource =
   \void main() {\n\
   \  gl_FragColor = u_color;\n\
   \}\n"
-
-arrayBuffer :: Int
-arrayBuffer = 34962
-
-elementArrayBuffer :: Int
-elementArrayBuffer = 34963
-
-staticDraw :: Int
-staticDraw = 35044
-
-glFloat :: Int
-glFloat = 5126
-
-unsignedShort :: Int
-unsignedShort = 5123
-
-triangles :: Int
-triangles = 4
-
-vertexShader :: Int
-vertexShader = 35633
-
-fragmentShader :: Int
-fragmentShader = 35632
-
-compileStatus :: Int
-compileStatus = 35713
-
-linkStatus :: Int
-linkStatus = 35714
-
-colorBufferBit :: Int
-colorBufferBit = 16384
-
-depthBufferBit :: Int
-depthBufferBit = 256
-
-depthTest :: Int
-depthTest = 2929
-
-lessEqual :: Int
-lessEqual = 515
