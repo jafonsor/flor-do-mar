@@ -22,8 +22,8 @@ The first playable tracer bullet is a minimal duel:
 - Browser client implemented with Haskell Reflex
 - WebGL battle rendering behind a Reflex-friendly wrapper
 - Player can issue a heading or sail command
-- Player can fire one broadside when range and firing arc allow it
-- Broadside damage is fixed hull damage after a reload cooldown
+- Player can lock a target and toggle fire at will; guns fire themselves when the locked target is inside a firing envelope that is loaded
+- Volley damage is fixed hull damage after a reload cooldown
 - A ship wins when the opposing ship's hull integrity reaches zero
 
 This scenario exists to prove the architecture and combat loop, not historical variety, balance, campaign structure, or visual polish.
@@ -43,7 +43,7 @@ The frontend should talk to combat through a server-like API. Early development 
 - **Local Combat API**: An in-process implementation of the Combat API used for local playtests and frontend development.
 - **Remote Combat API**: A future networked implementation of the same API for multiplayer.
 - **Scenario**: A predefined combat setup, including ships, positions, wind, and initial state.
-- **Command**: Player intent submitted to the Combat API, such as issuing a navigation order or firing a broadside.
+- **Command**: Player intent submitted to the Combat API, such as issuing a navigation order or ordering fire at will.
 - **Navigation order**: A movement command that tells a ship which waypoint to reach and what speed to target after reaching it. Avoid: direct steering.
 - **Autopilot**: A non-player behavior that issues navigation orders using the same movement model available to player commands. Avoid: special enemy movement.
 - **Orbit**: An autopilot pattern that keeps issuing navigation orders around a fixed center point.
@@ -62,12 +62,22 @@ The frontend should talk to combat through a server-like API. Early development 
 - **Tick**: The fixed simulation step. Commands are applied on ticks.
 - **Caravela**: The first ship type used by the minimal playable scenario.
 - **Hull integrity**: The initial win/loss resource. A ship is disabled when hull integrity reaches zero.
-- **Broadside**: A firing action that applies hull damage if the target is within range and firing arc.
-- **Firing arc**: The permitted angle from which a broadside can hit a target.
-- **Reload cooldown**: The delay before the same broadside can be fired again.
+- **Broadside**: One side of a ship's guns, taken as a group. Avoid: using it for the act of firing.
+- **Volley**: The firing of one side's guns as a single act. Avoid: shot, salvo.
+- **Reload cooldown**: The delay before the same guns can fire again. One reload covers both of a ship's broadsides.
 - **Wind**: A tactical environmental factor that affects movement and positioning.
 - **Crew ability**: A future activated ability provided by a crew member.
 - **Loadout**: The ship configuration chosen before battle, eventually including hull, guns, sails, rigging, officers, crew, cargo, and special capabilities.
+
+## Targeting and Gunnery
+
+- **Locked target**: The one ship a ship has selected to shoot at. A ship holds at most one at a time. Avoid: selected ship, current enemy.
+- **Lock**: The command that acquires or releases a locked target. It is a fire-control solution: the guns cannot fire without one.
+- **Firing arc**: The permitted angle for one broadside, measured from the beam. Avoid: cone, wedge.
+- **Firing envelope**: The whole area one broadside can reach — its firing arc out to the guns' practical range.
+- **Target inside**: The state of a broadside whose firing envelope contains the locked target.
+- **Fire at will**: The order that permits a ship's guns to fire. A ship whose guns are not permitted still reloads, and cannot be ordered to fire again until the reload finishes.
+- **Practical range**: The range at which guns are expected to be fought. It is shorter than the maximum a gun could reach.
 
 ## Deferred Concepts
 
@@ -81,6 +91,11 @@ These matter to the full game, but are out of scope for the first tracer bullet:
 - Critical hits
 - Projectile travel time
 - Accuracy modeling
+- Ships blocking or intercepting a shot aimed at another ship: for now a shot passes through anything in its line
+- Per-target lock acquisition, varied by hull size, speed, or camouflage
+- Damage and precision falloff over range
+- Energy or ammunition limits on firing
+- Realistic unit scale, and the gap between practical and maximum gun range
 - Historical faction asymmetry
 - Ship loadout UI
 - Campaign, economy, persistence, accounts, matchmaking, and multiplayer infrastructure
