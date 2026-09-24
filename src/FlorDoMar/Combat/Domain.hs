@@ -26,6 +26,7 @@ module FlorDoMar.Combat.Domain
   , canFireBroadside
   , canFireBroadsideWith
   , canLockTarget
+  , canSetFireAtWill
   , caravelaDuel
   , legacyBroadsideTuning
   , legacyMovementPhysics
@@ -44,6 +45,9 @@ module FlorDoMar.Combat.Domain
   )
 where
 
+import Control.Monad (guard)
+import Data.List (find)
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 
 data ShipId
@@ -261,18 +265,23 @@ tickCombatWithTuning tickSeconds movementForShip broadsideTuningForShip commands
       let
         commanded =
           foldl
-            (applyCommand tickSeconds movementForShip broadsideTuningForShip)
+            (applyCommand tickSeconds movementForShip)
             (coolDownReloads state {combatTick = combatTick state + 1})
             commands
-        resolved = finishIfTerminal commanded
+        -- The volley phase sits between the tick's commands and its movement. A
+        -- volley is therefore judged against the geometry the client last drew —
+        -- the post-command, pre-movement state — rather than against positions
+        -- the player has not seen yet, and its damage belongs to this tick, so
+        -- 'finishIfTerminal' runs straight after it.
+        resolved = finishIfTerminal (fireVolleys broadsideTuningForShip commanded)
        in
         case combatStatus resolved of
           ScenarioFinished _ -> resolved
           ScenarioRunning ->
             finishIfTerminal $
-              issueEnemyOrbitOrder tickSeconds movementForShip broadsideTuningForShip $
+              issueEnemyOrbitOrder tickSeconds movementForShip $
                 moveShips tickSeconds movementForShip $
-                  issueEnemyOrbitOrder tickSeconds movementForShip broadsideTuningForShip resolved
+                  issueEnemyOrbitOrder tickSeconds movementForShip resolved
 
 canFireBroadside :: CombatState -> ShipId -> ShipId -> BroadsideSide -> BroadsideCheck
 canFireBroadside = canFireBroadsideWith (const legacyBroadsideTuning)
@@ -357,13 +366,28 @@ scenarioContainsShip :: ShipId -> CombatState -> Bool
 scenarioContainsShip identity state =
   identity `elem` fmap shipId [combatPlayer state, combatEnemy state]
 
--- | The total, pure command transition.
+-- | Whether @permitted@ may be applied to the guns of @identity@.
 --
--- The broadside tuning argument stays in the signature because the firing phase
--- that consumes it arrives in the next issue; nothing in this issue fires, so it
--- is not read here yet.
-applyCommand :: Double -> (Ship -> MovementPhysics) -> (Ship -> BroadsideTuning) -> CombatState -> CombatCommand -> CombatState
-applyCommand tickSeconds movementForShip _broadsideTuningForShip state command =
+-- Granting permission is the one fire-control order that can be refused: a ship
+-- whose shared reload is still running cannot be ordered to fire again, or the
+-- cooldown could be gamed by toggling. Withdrawing permission is always allowed,
+-- because stopping is never what needs blocking.
+--
+-- The guard reads the reload counter as it stands when the command is applied,
+-- which is after the tick's decrement. A reload that reaches zero on this tick
+-- has therefore already finished, and an order arriving on that tick is accepted
+-- — and may catch that same tick's volley.
+canSetFireAtWill :: CombatState -> ShipId -> Bool -> BroadsideCheck
+canSetFireAtWill state identity permitted
+  | not permitted = BroadsideReady
+  | shipReload ship > 0 = BroadsideReloading (shipReload ship)
+  | otherwise = BroadsideReady
+ where
+  ship = selectShip identity state
+
+-- | The total, pure command transition.
+applyCommand :: Double -> (Ship -> MovementPhysics) -> CombatState -> CombatCommand -> CombatState
+applyCommand tickSeconds movementForShip state command =
   case command of
     SetHeading identity heading ->
       updateNavigatingShip identity (\ship -> ship {shipTargetHeading = normalizeHeading heading}) state
@@ -387,7 +411,9 @@ applyCommand tickSeconds movementForShip _broadsideTuningForShip state command =
         BroadsideReady -> updateShip lockerId (toggleLockedTarget targetId) state
         _ -> state
     SetFireAtWill identity permitted ->
-      updateShip identity (\ship -> ship {shipFirePermission = permitted}) state
+      case canSetFireAtWill state identity permitted of
+        BroadsideReady -> updateShip identity (\ship -> ship {shipFirePermission = permitted}) state
+        _ -> state
 
 -- | Take the named target, or let go of the one already held.
 toggleLockedTarget :: ShipId -> Ship -> Ship
@@ -400,11 +426,8 @@ toggleLockedTarget targetId ship =
     }
 
 -- | Apply one volley's damage to a ship, keeping the damage recorded and the
--- hull consistent.
---
--- The firing phase that consumes this arrives in the next issue, so for now it
--- has no caller in the simulation; the tests drive it directly rather than
--- restating the accounting in their fixtures.
+-- hull consistent. This is the accounting the volley phase fires with; tests
+-- that need damage without a volley use it directly rather than restating it.
 applyBroadsideDamage :: Int -> Ship -> Ship
 applyBroadsideDamage damage ship =
   ship
@@ -418,6 +441,57 @@ applyBroadsideDamage damage ship =
 coolDownReloads :: CombatState -> CombatState
 coolDownReloads =
   updateBothShips (\ship -> ship {shipReload = max 0 (shipReload ship - 1)})
+
+-- | Fire one volley per ship whose loaded guns can reach its locked target.
+--
+-- This is the phase that turns the fire-control state into damage. Every shot is
+-- decided against the state the phase started with and only then applied, so two
+-- ships that can both reach each other trade volleys in the same tick: neither
+-- can disable the other out of its own shot. The enemy fires through this phase
+-- exactly as the player does.
+--
+-- The whole envelope test is 'canFireBroadsideWith' — the same predicate the
+-- snapshot publishes per side — so the area a client draws and the area the guns
+-- obey stay one computation.
+fireVolleys :: (Ship -> BroadsideTuning) -> CombatState -> CombatState
+fireVolleys broadsideTuningForShip state =
+  case combatStatus state of
+    ScenarioFinished _ -> state
+    ScenarioRunning -> foldl fireVolley state (volleys state)
+ where
+  volleys current =
+    mapMaybe (volleyFor broadsideTuningForShip current) [combatPlayer current, combatEnemy current]
+
+-- | The volley @attacker@ fires this tick, or 'Nothing' when its guns stay
+-- silent.
+--
+-- Permission and the lock are what this phase adds to the guard chain; everything
+-- else — loaded guns, a live attacker and target, range and arc — is the existing
+-- broadside check.
+volleyFor :: (Ship -> BroadsideTuning) -> CombatState -> Ship -> Maybe (ShipId, ShipId, BroadsideTuning)
+volleyFor broadsideTuningForShip state attacker = do
+  guard (shipFirePermission attacker)
+  targetId <- shipLockedTarget attacker
+  guard (scenarioContainsShip targetId state)
+  -- Whichever side holds the target is the side that fires, and the other cannot.
+  -- The two firing arcs are disjoint for any half-angle the shipped configs can
+  -- use, so there is exactly one candidate; 'find' keeps the choice deterministic
+  -- if a config ever makes both sides ready.
+  _ <- find (holdsTarget targetId) [Port, Starboard]
+  pure (shipId attacker, targetId, broadsideTuningForShip attacker)
+ where
+  holdsTarget targetId side =
+    canFireBroadsideWith broadsideTuningForShip state (shipId attacker) targetId side == BroadsideReady
+
+fireVolley :: CombatState -> (ShipId, ShipId, BroadsideTuning) -> CombatState
+fireVolley state (attackerId, targetId, tuning) =
+  updateShip attackerId (startReload tuning) $
+    updateShip targetId (applyBroadsideDamage (broadsideTuningDamage tuning)) state
+
+-- | One reload covers both broadsides, so a volley resets the ship's single
+-- counter to its boat's configured reload ticks.
+startReload :: BroadsideTuning -> Ship -> Ship
+startReload tuning ship = ship {shipReload = broadsideTuningReloadTicks tuning}
 
 moveShips :: Double -> (Ship -> MovementPhysics) -> CombatState -> CombatState
 moveShips tickSeconds movementForShip =
@@ -471,12 +545,12 @@ enemyOrbitAutopilotAt center =
     , enemyOrbitNextWaypointIndex = 0
     }
 
-issueEnemyOrbitOrder :: Double -> (Ship -> MovementPhysics) -> (Ship -> BroadsideTuning) -> CombatState -> CombatState
-issueEnemyOrbitOrder tickSeconds movementForShip broadsideTuningForShip state
+issueEnemyOrbitOrder :: Double -> (Ship -> MovementPhysics) -> CombatState -> CombatState
+issueEnemyOrbitOrder tickSeconds movementForShip state
   | shipHull enemy <= 0 = state
   | shipNavigationOrder enemy /= Nothing = state
   | otherwise =
-      applyCommand tickSeconds movementForShip broadsideTuningForShip advancedAutopilot (IssueNavigationOrder EnemyShip waypoint)
+      applyCommand tickSeconds movementForShip advancedAutopilot (IssueNavigationOrder EnemyShip waypoint)
  where
   enemy = combatEnemy state
   autopilot = combatEnemyOrbitAutopilot state

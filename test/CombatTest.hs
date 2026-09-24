@@ -26,6 +26,22 @@ main = do
   testInvalidBroadsideRange
   testInvalidBroadsideArc
   testReloadCooldownIsUnaffectedByFiringStateCommands
+  testVolleyFiresOnTheTickTheQueuedArmOrderApplies
+  testVolleyLeavesOnTheTickTheReloadReachesZero
+  testNoVolleyWithoutALockedTarget
+  testNoVolleyWithoutFirePermission
+  testNoVolleyWhileTheGunsAreReloading
+  testNoVolleyWhenTheTargetIsOutsideBothFiringEnvelopes
+  testNoVolleyWhenTheTargetIsBeyondTheEnvelopeReach
+  testTheSideHoldingTheTargetIsTheOneThatFires
+  testFiringEitherSideStartsTheOneSharedReload
+  testWithdrawingDuringAReloadPreventsTheCompletingVolley
+  testWithdrawingDuringAReloadLeavesTheReloadCountingDown
+  testArmingIsRefusedAndReportedWhileTheReloadIsAboveZero
+  testArmingOnTheTickTheReloadCompletesCatchesThatTicksVolley
+  testVolleysInOneTickResolveSimultaneously
+  testVolleysJudgeTheGeometryTheClientLastDrew
+  testADisabledShipFiresNothing
   testTerminalHullState
   testLoadsRuntimeCombatConfig
   testRejectsMalformedRuntimeCombatConfig
@@ -49,7 +65,9 @@ main = do
   testLocalApiExposesNavigationOrder
   testEnemyOrbitAutopilotIssuesNavigationOrders
   testConfiguredBroadsideTuning
+  testConfiguredVolleysUseTheBoatTuning
   testConfiguredMovementSnapshot
+  testConfiguredLocalApiBroadsideTuning
   testConfiguredLocalApiHotReloadsLiveEngagement
   testHotReloadPreservesCommittedNavigationWaypoint
   testInvalidReloadKeepsLastValidConfigAndSnapshot
@@ -60,6 +78,8 @@ main = do
   testSnapshotCarriesLockedTargetAndFirePermission
   testLocalApiQueuesCommandsUntilTick
   testLocalApiExposesLockedTargetAndFirePermission
+  testLocalApiFiresAndWithdrawsThroughTheQueuedOrders
+  testLocalApiReportsTerminalState
   testInitialBattleRenderScene
   testDamagedBattleRenderSceneTint
   testActiveNavigationRenderScene
@@ -264,12 +284,18 @@ testInvalidBroadsideArc = do
     other -> die $ "expected TargetOutsideFiringArc, got " <> show other
 
 -- | The reload is the whole of the delay the firing model rests on, so it has to
--- keep running on its own clock while the new fire-control state is set.
+-- keep running on its own clock while the fire-control state is set.
+--
+-- Issue 01 asserted here that permission could be granted during a reload. Issue
+-- 02 supersedes exactly that rule: re-engaging during a reload is refused, so the
+-- arm order in this sequence is deliberately not applied. The test's subject is
+-- untouched — the counter is neither reset nor slowed by the commands, and it
+-- still reaches zero.
 testReloadCooldownIsUnaffectedByFiringStateCommands :: IO ()
 testReloadCooldownIsUnaffectedByFiringStateCommands = do
   let
-    -- Nothing fires in this issue, so the reload a volley would have started is
-    -- part of the fixture.
+    -- A volley is what starts this reload; the fixture sets it so the test stays
+    -- about the cooldown rather than about firing.
     reloading =
       caravelaDuel
         { combatPlayer = (combatPlayer caravelaDuel) {shipReload = reloadTicks}
@@ -285,7 +311,8 @@ testReloadCooldownIsUnaffectedByFiringStateCommands = do
     readyAgain = tickCombat [] cooledOnce
   assertEqual "firing state commands leave the reload counter alone" (shipReload (combatPlayer uncommanded)) (shipReload (combatPlayer commanded))
   assertEqual "a lock does not need loaded guns" (Just EnemyShip) (shipLockedTarget (combatPlayer commanded))
-  assertEqual "fire at will does not need loaded guns" True (shipFirePermission (combatPlayer commanded))
+  assertEqual "the arm order is refused during a reload and leaves the guns disengaged" False (shipFirePermission (combatPlayer commanded))
+  assertEqual "the refused arm order fires nothing" 100 (shipHull (combatEnemy commanded))
   case canFireBroadside commanded PlayerShip EnemyShip Port of
     BroadsideReloading remaining ->
       assertEqual "a reloading ship reports its own remaining reload" (shipReload (combatPlayer commanded)) remaining
@@ -293,11 +320,292 @@ testReloadCooldownIsUnaffectedByFiringStateCommands = do
   assertEqual "reload counts down once" 1 (shipReload (combatPlayer cooledOnce))
   assertEqual "reload reaches ready" 0 (shipReload (combatPlayer readyAgain))
 
+-- | A ship that is locked, loaded and permitted fires on the tick its queued
+-- order applies. Commands and the volley phase share one tick, so from the
+-- player's side the volley leaves on the tick after they arm.
+testVolleyFiresOnTheTickTheQueuedArmOrderApplies :: IO ()
+testVolleyFiresOnTheTickTheQueuedArmOrderApplies = do
+  let
+    armed =
+      tickCombat
+        [ Lock PlayerShip EnemyShip
+        , SetFireAtWill PlayerShip True
+        ]
+        caravelaDuel
+  assertEqual "the arm order is stored on the tick it applies" True (shipFirePermission (combatPlayer armed))
+  assertEqual "the volley damages the locked target on that tick" 75 (shipHull (combatEnemy armed))
+  assertEqual "the volley starts the boat's configured reload" reloadTicks (shipReload (combatPlayer armed))
+  assertEqual "the firing ship takes nothing from its own volley" 100 (shipHull (combatPlayer armed))
+
+-- | The reload counts down at the top of the tick, before the tick's commands,
+-- so the tick that empties it is itself a tick that can fire.
+testVolleyLeavesOnTheTickTheReloadReachesZero :: IO ()
+testVolleyLeavesOnTheTickTheReloadReachesZero = do
+  let
+    firstVolley = tickCombat [] playerReadyToFire
+    cooling = tickCombat [] firstVolley
+    oneTickLeft = tickCombat [] cooling
+    completing = tickCombat [] oneTickLeft
+  assertEqual "the first volley leaves the enemy damaged" 75 (shipHull (combatEnemy firstVolley))
+  assertEqual "no volley leaves while the shared reload runs" 75 (shipHull (combatEnemy oneTickLeft))
+  assertEqual "the reload is down to its last tick" 1 (shipReload (combatPlayer oneTickLeft))
+  assertEqual "the volley leaves on the tick the reload reaches zero" 50 (shipHull (combatEnemy completing))
+  assertEqual "the completing volley starts the reload again" reloadTicks (shipReload (combatPlayer completing))
+
+-- | A volley needs a lock, whatever the guns are doing.
+testNoVolleyWithoutALockedTarget :: IO ()
+testNoVolleyWithoutALockedTarget = do
+  let
+    armedOnly = tickCombat [SetFireAtWill PlayerShip True] caravelaDuel
+    -- A lock the scenario cannot honour — its enemy slot answers to the player's
+    -- id — is no target for the guns either.
+    absentTarget =
+      playerReadyToFire
+        { combatEnemy = (combatEnemy caravelaDuel) {shipId = PlayerShip}
+        }
+    firedAtNothing = tickCombat [] absentTarget
+  assertEqual "a ship permitted to fire with no lock fires nothing" 100 (shipHull (combatEnemy armedOnly))
+  assertEqual "a ship permitted to fire with no lock stays loaded" 0 (shipReload (combatPlayer armedOnly))
+  assertEqual "a lock on a ship the scenario does not carry fires nothing" 100 (shipHull (combatEnemy firedAtNothing))
+  assertEqual "a lock on a ship the scenario does not carry starts no reload" 0 (shipReload (combatPlayer firedAtNothing))
+
+testNoVolleyWithoutFirePermission :: IO ()
+testNoVolleyWithoutFirePermission = do
+  let ticked = tickCombat [] playerHoldingFire
+  assertEqual "a locked, loaded ship whose guns are not permitted fires nothing" 100 (shipHull (combatEnemy ticked))
+  assertEqual "a ship whose guns are not permitted stays loaded" 0 (shipReload (combatPlayer ticked))
+
+testNoVolleyWhileTheGunsAreReloading :: IO ()
+testNoVolleyWhileTheGunsAreReloading = do
+  let
+    reloading =
+      playerReadyToFire
+        { combatPlayer = (combatPlayer playerReadyToFire) {shipReload = 2}
+        }
+    ticked = tickCombat [] reloading
+  assertEqual "a reloading ship fires nothing" 100 (shipHull (combatEnemy ticked))
+  assertEqual "the reload keeps counting down while the guns are loaded and held" 1 (shipReload (combatPlayer ticked))
+  assertEqual "the lock survives the reload" (Just EnemyShip) (shipLockedTarget (combatPlayer ticked))
+
+-- | Turning the ship across the target's bearing puts it ninety degrees off both
+-- beams, so neither envelope reaches it.
+testNoVolleyWhenTheTargetIsOutsideBothFiringEnvelopes :: IO ()
+testNoVolleyWhenTheTargetIsOutsideBothFiringEnvelopes = do
+  let
+    abeam =
+      playerReadyToFire
+        { combatPlayer = (combatPlayer playerReadyToFire) {shipHeading = Heading 90, shipTargetHeading = Heading 90}
+        }
+    ticked = tickCombat [] abeam
+  case canFireBroadside abeam PlayerShip EnemyShip Port of
+    TargetOutsideFiringArc _ -> pure ()
+    other -> die $ "expected the port side to hold nothing, got " <> show other
+  case canFireBroadside abeam PlayerShip EnemyShip Starboard of
+    TargetOutsideFiringArc _ -> pure ()
+    other -> die $ "expected the starboard side to hold nothing, got " <> show other
+  assertEqual "no volley fires when the target is outside both envelopes" 100 (shipHull (combatEnemy ticked))
+  assertEqual "the guns stay loaded when the target is outside both envelopes" 0 (shipReload (combatPlayer ticked))
+
+testNoVolleyWhenTheTargetIsBeyondTheEnvelopeReach :: IO ()
+testNoVolleyWhenTheTargetIsBeyondTheEnvelopeReach = do
+  let
+    beyondReach =
+      playerReadyToFire
+        { combatEnemy = (combatEnemy caravelaDuel) {shipPosition = Point 0 (broadsideRange + 50)}
+        }
+    ticked = tickCombat [] beyondReach
+  case canFireBroadside beyondReach PlayerShip EnemyShip Port of
+    TargetOutOfRange _ -> pure ()
+    other -> die $ "expected TargetOutOfRange, got " <> show other
+  assertEqual "no volley fires past the guns' reach" 100 (shipHull (combatEnemy ticked))
+  assertEqual "the guns stay loaded past the guns' reach" 0 (shipReload (combatPlayer ticked))
+
+-- | The side that fires is the side whose envelope holds the target, and only
+-- that side: one tick with both sides checked fires one broadside.
+testTheSideHoldingTheTargetIsTheOneThatFires :: IO ()
+testTheSideHoldingTheTargetIsTheOneThatFires = do
+  let
+    targetOnPort = playerReadyToFire
+    targetOnStarboard =
+      playerReadyToFire
+        { combatEnemy = (combatEnemy caravelaDuel) {shipPosition = Point 0 (-80)}
+        }
+    portVolley = tickCombat [] targetOnPort
+    starboardVolley = tickCombat [] targetOnStarboard
+  assertEqual "the duel's enemy sits in the port envelope" BroadsideReady (canFireBroadside targetOnPort PlayerShip EnemyShip Port)
+  case canFireBroadside targetOnPort PlayerShip EnemyShip Starboard of
+    TargetOutsideFiringArc _ -> pure ()
+    other -> die $ "expected the starboard side to hold nothing, got " <> show other
+  assertEqual "the port volley lands" 75 (shipHull (combatEnemy portVolley))
+  assertEqual "with the enemy to the south the starboard envelope holds instead" BroadsideReady (canFireBroadside targetOnStarboard PlayerShip EnemyShip Starboard)
+  case canFireBroadside targetOnStarboard PlayerShip EnemyShip Port of
+    TargetOutsideFiringArc _ -> pure ()
+    other -> die $ "expected the port side to hold nothing, got " <> show other
+  assertEqual "the side that holds the target fires once, not twice" 75 (shipHull (combatEnemy starboardVolley))
+
+-- | One reload covers both broadsides: after a starboard volley the port side is
+-- as blocked as the side that fired.
+testFiringEitherSideStartsTheOneSharedReload :: IO ()
+testFiringEitherSideStartsTheOneSharedReload = do
+  let
+    targetOnStarboard =
+      playerReadyToFire
+        { combatEnemy = (combatEnemy caravelaDuel) {shipPosition = Point 0 (-80)}
+        }
+    fired = tickCombat [] targetOnStarboard
+    nextTick = tickCombat [] fired
+  assertEqual "the volley starts the boat's configured reload" reloadTicks (shipReload (combatPlayer fired))
+  case canFireBroadside fired PlayerShip EnemyShip Starboard of
+    BroadsideReloading remaining ->
+      assertEqual "the side that fired reports the shared reload" reloadTicks remaining
+    other -> die $ "expected BroadsideReloading on the side that fired, got " <> show other
+  case canFireBroadside fired PlayerShip EnemyShip Port of
+    BroadsideReloading remaining ->
+      assertEqual "the other side reports the same shared reload" reloadTicks remaining
+    other -> die $ "expected BroadsideReloading on the other side, got " <> show other
+  assertEqual "the other side fires nothing while the shared reload runs" (shipHull (combatEnemy fired)) (shipHull (combatEnemy nextTick))
+
+testWithdrawingDuringAReloadPreventsTheCompletingVolley :: IO ()
+testWithdrawingDuringAReloadPreventsTheCompletingVolley = do
+  let
+    firstVolley = tickCombat [] playerReadyToFire
+    withdrawn = tickCombat [SetFireAtWill PlayerShip False] firstVolley
+    completing = tickCombat [] (tickCombat [] withdrawn)
+  assertEqual "withdrawing permission during a reload is accepted" False (shipFirePermission (combatPlayer withdrawn))
+  assertEqual "the enemy took exactly the first volley" 75 (shipHull (combatEnemy completing))
+  assertEqual "no volley leaves on the tick the reload completes once permission is withdrawn" (shipHull (combatEnemy withdrawn)) (shipHull (combatEnemy completing))
+
+testWithdrawingDuringAReloadLeavesTheReloadCountingDown :: IO ()
+testWithdrawingDuringAReloadLeavesTheReloadCountingDown = do
+  let
+    firstVolley = tickCombat [] playerReadyToFire
+    withdrawn = tickCombat [SetFireAtWill PlayerShip False] firstVolley
+    cooledOnce = tickCombat [] withdrawn
+    loaded = tickCombat [] cooledOnce
+    rearmed = tickCombat [SetFireAtWill PlayerShip True] loaded
+  assertEqual "the reload counts down while the guns are disengaged" 1 (shipReload (combatPlayer cooledOnce))
+  assertEqual "the reload reaches zero while the guns are disengaged" 0 (shipReload (combatPlayer loaded))
+  assertEqual "the disengaged ship fires nothing on the tick its reload completes" 75 (shipHull (combatEnemy loaded))
+  assertEqual "re-engaging after the reload reaches zero is accepted" True (shipFirePermission (combatPlayer rearmed))
+  assertEqual "the re-engaged ship fires on the tick its order applies" 50 (shipHull (combatEnemy rearmed))
+
+-- | Re-engaging during a reload is refused by a named guard rather than being
+-- silently ignored. The reload has already counted down for this tick when the
+-- order is applied, and the guard reports the counter's post-decrement value.
+testArmingIsRefusedAndReportedWhileTheReloadIsAboveZero :: IO ()
+testArmingIsRefusedAndReportedWhileTheReloadIsAboveZero = do
+  let
+    reloading =
+      playerHoldingFire
+        { combatPlayer = (combatPlayer playerHoldingFire) {shipReload = reloadTicks}
+        }
+    refused = tickCombat [SetFireAtWill PlayerShip True] reloading
+  assertEqual "the guard names the reload as the refusal" (BroadsideReloading reloadTicks) (canSetFireAtWill reloading PlayerShip True)
+  assertEqual "the tick's decrement still applies to the refused order" 2 (shipReload (combatPlayer refused))
+  assertEqual "the refused order does not permit the guns" False (shipFirePermission (combatPlayer refused))
+  assertEqual "the refused order fires nothing" 100 (shipHull (combatEnemy refused))
+
+-- | The reload counts down before the tick's commands are applied, so an arm
+-- order that lands on the tick the reload reaches zero is accepted and catches
+-- that tick's volley.
+testArmingOnTheTickTheReloadCompletesCatchesThatTicksVolley :: IO ()
+testArmingOnTheTickTheReloadCompletesCatchesThatTicksVolley = do
+  let
+    oneTickLeft =
+      playerHoldingFire
+        { combatPlayer = (combatPlayer playerHoldingFire) {shipReload = 1}
+        }
+    caught = tickCombat [SetFireAtWill PlayerShip True] oneTickLeft
+  assertEqual "the guard would refuse the order against the counter's pre-tick value" (BroadsideReloading 1) (canSetFireAtWill oneTickLeft PlayerShip True)
+  assertEqual "the tick's decrement leaves the guns loaded for the order" True (shipFirePermission (combatPlayer caught))
+  assertEqual "the arm order catches that tick's volley" 75 (shipHull (combatEnemy caught))
+  assertEqual "the caught volley starts the reload" reloadTicks (shipReload (combatPlayer caught))
+
+-- | Every volley in a tick is decided before any of them is applied, so two
+-- ships that can each disable the other both land their shot. A phase that
+-- resolved one ship at a time would leave the first shooter afloat.
+testVolleysInOneTickResolveSimultaneously :: IO ()
+testVolleysInOneTickResolveSimultaneously = do
+  let
+    bothEngaged =
+      caravelaDuel
+        { combatPlayer = combatPlayer playerReadyToFire
+        , combatEnemy =
+            (combatEnemy caravelaDuel)
+              { shipLockedTarget = Just PlayerShip
+              , shipFirePermission = True
+              }
+        }
+    lethal = legacyBroadsideTuning {broadsideTuningDamage = shipMaxHull (combatPlayer caravelaDuel)}
+    resolved = tickCombatWithTuning 1 (const legacyMovementPhysics) (const lethal) [] bothEngaged
+  assertEqual "the player's volley disables the enemy on that tick" 0 (shipHull (combatEnemy resolved))
+  assertEqual "the enemy's volley lands although it was disabled in the same tick" 0 (shipHull (combatPlayer resolved))
+  assertEqual "the duel ends on the tick both volleys land" (ScenarioFinished MutualDestruction) (combatStatus resolved)
+
+testADisabledShipFiresNothing :: IO ()
+testADisabledShipFiresNothing = do
+  let
+    disabled =
+      playerReadyToFire
+        { combatPlayer = (combatPlayer playerReadyToFire) {shipHull = 0}
+        }
+    ticked = tickCombat [] disabled
+  assertEqual "a disabled ship fires nothing" 100 (shipHull (combatEnemy ticked))
+  assertEqual "a disabled ship starts no reload" 0 (shipReload (combatPlayer ticked))
+
+-- | The volley phase runs before the tick's movement, so the guns are judged on
+-- the geometry the client last drew — the end of the previous tick — rather than
+-- on positions the player has not seen yet. Here the enemy is in reach when the
+-- tick starts and its own move carries it far out of reach within that same tick;
+-- the volley still leaves.
+testVolleysJudgeTheGeometryTheClientLastDrew :: IO ()
+testVolleysJudgeTheGeometryTheClientLastDrew = do
+  let
+    fleeing =
+      playerReadyToFire
+        { combatEnemy =
+            (combatEnemy playerReadyToFire)
+              { shipCurrentSpeed = 200
+              , shipTargetSpeed = 200
+              }
+        }
+    fired = tickCombat [] fleeing
+    -- The player's own reload would mask the geometry check, so the end-of-tick
+    -- geometry is read from a copy with the guns loaded.
+    firedAtRest = fired {combatPlayer = (combatPlayer fired) {shipReload = 0}}
+  assertEqual "the enemy is in reach when the tick starts" BroadsideReady (canFireBroadside fleeing PlayerShip EnemyShip Port)
+  assertEqual "the volley leaves before the enemy's move carries it away" 75 (shipHull (combatEnemy fired))
+  case canFireBroadside firedAtRest PlayerShip EnemyShip Port of
+    TargetOutOfRange _ -> pure ()
+    other -> die $ "expected the enemy to end the tick out of reach, got " <> show other
+
+-- | The state every firing test varies one field of: a loaded ship, locked on the
+-- enemy, permitted to fire, with the duel's opening geometry holding the enemy in
+-- its port envelope.
+playerReadyToFire :: CombatState
+playerReadyToFire =
+  caravelaDuel
+    { combatPlayer =
+        (combatPlayer caravelaDuel)
+          { shipLockedTarget = Just EnemyShip
+          , shipFirePermission = True
+          }
+    }
+
+-- | The same ship with its guns still disengaged: what an arm order is applied
+-- to.
+playerHoldingFire :: CombatState
+playerHoldingFire =
+  playerReadyToFire
+    { combatPlayer = (combatPlayer playerReadyToFire) {shipFirePermission = False}
+    }
+
 testTerminalHullState :: IO ()
 testTerminalHullState = do
   let
-    -- Nothing fires in this issue, so the disabling damage is part of the
-    -- fixture; the rule under test is what a disabled hull does to the tick.
+    -- The disabling damage is part of the fixture; the rule under test is what a
+    -- disabled hull does to the tick. Firing is what ends the duel through the
+    -- local API, which its own test covers.
     disabledEnemy = applyBroadsideDamage (shipMaxHull (combatEnemy caravelaDuel)) (combatEnemy caravelaDuel)
     almostDisabled = caravelaDuel {combatEnemy = disabledEnemy}
     finished = tickCombat [] almostDisabled
@@ -807,13 +1115,7 @@ testConfiguredBroadsideTuning :: IO ()
 testConfiguredBroadsideTuning = do
   config <- expectRight "load packaged config for broadside tuning" =<< loadRuntimeCombatConfig
   let
-    tunedConfig =
-      config
-        { combatConfigBoats =
-            [ tuneBoat boat
-            | boat <- combatConfigBoats config
-            ]
-        }
+    tunedConfig = tunedBoatConfig config
     bigAtLongRange = configuredDefaultEngagement tunedConfig
     bigTuning = broadsideTuningForShip tunedConfig (combatPlayer bigAtLongRange)
     bigAtShortRange =
@@ -848,6 +1150,52 @@ testConfiguredBroadsideTuning = do
   case canFireBroadsideWith (broadsideTuningForShip tunedConfig) bigArcState PlayerShip EnemyShip Port of
     TargetOutsideFiringArc _ -> pure ()
     other -> die $ "configured big firing arc: expected TargetOutsideFiringArc, got " <> show other
+
+-- | Per-boat tuning reaches the volley itself: the configured range and arc
+-- decide whether one leaves, and the configured damage and reload decide what it
+-- does. The tuning is 'tunedBoatConfig', so the big and small boats pull in
+-- opposite directions.
+testConfiguredVolleysUseTheBoatTuning :: IO ()
+testConfiguredVolleysUseTheBoatTuning = do
+  config <- expectRight "load packaged config for configured volleys" =<< loadRuntimeCombatConfig
+  let
+    tunedConfig = tunedBoatConfig config
+    engagement = configuredDefaultEngagement tunedConfig
+    engagedAt position =
+      engagement
+        { combatPlayer = (combatPlayer engagement) {shipLockedTarget = Just EnemyShip, shipFirePermission = True}
+        , combatEnemy = (combatEnemy engagement) {shipPosition = position}
+        }
+    beyondConfiguredRange = tickConfiguredCombat tunedConfig [] (engagedAt (Point 0 80))
+    outsideConfiguredArc = tickConfiguredCombat tunedConfig [] (engagedAt (Point 30 60))
+    inside = tickConfiguredCombat tunedConfig [] (engagedAt (Point 0 60))
+    smallFlyingEngagement =
+      case configuredEngagement tunedConfig "small" "big" of
+        Just state ->
+          state
+            { combatPlayer = (combatPlayer state) {shipLockedTarget = Just EnemyShip, shipFirePermission = True}
+            }
+        Nothing -> error "validated combat config is missing a configured boat kind"
+    smallVolley = tickConfiguredCombat tunedConfig [] smallFlyingEngagement
+  assertEqual "a target past the configured range takes no volley" 80 (shipHull (combatEnemy beyondConfiguredRange))
+  assertEqual "a target outside the configured arc takes no volley" 80 (shipHull (combatEnemy outsideConfiguredArc))
+  assertEqual "the configured damage is what the volley applies" 49 (shipHull (combatEnemy inside))
+  assertEqual "the configured reload is what the volley starts" 4 (shipReload (combatPlayer inside))
+  assertEqual "the small boat's configured damage is what its volley applies" 147 (shipHull (combatEnemy smallVolley))
+  assertEqual "the small boat's configured reload is what its volley starts" 1 (shipReload (combatPlayer smallVolley))
+
+-- | Boat tuning distinct from the shipped values: the big boat reaches less far
+-- with a narrower arc and hits harder and slower, the small boat keeps the
+-- shipped reach with a lighter, quicker broadside. Every configured-gunnery test
+-- uses it, so they cannot drift apart.
+tunedBoatConfig :: CombatConfig -> CombatConfig
+tunedBoatConfig config =
+  config
+    { combatConfigBoats =
+        [ tuneBoat boat
+        | boat <- combatConfigBoats config
+        ]
+    }
  where
   tuneBoat boat =
     case boatConfigId boat of
@@ -919,6 +1267,35 @@ testConfiguredMovementSnapshot = do
   assertApprox "snapshot exposes signed current yaw rate" 0 (shipSnapshotCurrentYawRate player)
   assertApprox "snapshot exposes signed yaw rate after acceleration" (-8) (shipSnapshotCurrentYawRate secondPlayer)
 
+-- | Configured gunnery tuning is what a volley through the API actually uses:
+-- the tuned damage lands on the enemy and the tuned reload appears in the
+-- player's snapshot.
+testConfiguredLocalApiBroadsideTuning :: IO ()
+testConfiguredLocalApiBroadsideTuning = do
+  config <- expectRight "load packaged config for API broadside tuning" =<< loadRuntimeCombatConfig
+  let
+    tunedConfig =
+      config
+        { combatConfigBoats =
+            [ boat {boatConfigBroadsideDamage = 31, boatConfigReloadTicks = 4}
+            | boat <- combatConfigBoats config
+            ]
+        }
+  localApi <- newConfiguredLocalCombatApi tunedConfig
+  let api = localCombatApi localApi
+  _ <- expectRight "start configured scenario for API broadside tuning" =<< combatApiStartScenario api caravelaDuelScenarioId
+  _ <- queueLocalCommand "queue configured API lock" api (Lock PlayerShip EnemyShip)
+  _ <- queueLocalCommand "queue configured API fire at will" api (SetFireAtWill PlayerShip True)
+  snapshot <- advanceLocalApiTick "advance configured API volley" api
+  player <- expectShipSnapshot "configured API broadside player" PlayerShip snapshot
+  enemy <- expectShipSnapshot "configured API broadside enemy" EnemyShip snapshot
+  assertEqual "configured API volley damage reaches the snapshot" 49 (shipSnapshotHull enemy)
+  assertEqual "configured API volley reload reaches the snapshot" 4 (shipSnapshotReload player)
+
+-- | A hot reload refreshes what the boat kind owns while live state survives it.
+-- The opening volley is deliberate: it makes the reload across the reload
+-- non-zero, and the tuning the reloaded config supplies is then proven by the
+-- volley that follows rather than by the config object alone.
 testConfiguredLocalApiHotReloadsLiveEngagement :: IO ()
 testConfiguredLocalApiHotReloadsLiveEngagement = do
   config <- expectRight "load packaged config for hot reload" =<< loadRuntimeCombatConfig
@@ -944,6 +1321,9 @@ testConfiguredLocalApiHotReloadsLiveEngagement = do
   assertEqual "hot reload keeps player physical heading" (shipSnapshotHeading playerBefore) (shipSnapshotHeading playerAfter)
   assertEqual "hot reload keeps player target heading" (shipSnapshotTargetHeading playerBefore) (shipSnapshotTargetHeading playerAfter)
   assertApprox "hot reload keeps player speed" (shipSnapshotCurrentSpeed playerBefore) (shipSnapshotCurrentSpeed playerAfter)
+  -- The volley on the tick before the reload sets this, so comparing it is not
+  -- zero against zero: a hot reload that reset the cooldown would show here.
+  assertEqual "the opening volley starts a reload before the hot reload" reloadTicks (shipSnapshotReload playerBefore)
   assertEqual "hot reload keeps player reload" (shipSnapshotReload playerBefore) (shipSnapshotReload playerAfter)
   assertEqual "hot reload keeps the player's locked target" (shipSnapshotLockedTarget playerBefore) (shipSnapshotLockedTarget playerAfter)
   assertEqual "hot reload keeps the player's fire permission" (shipSnapshotFirePermission playerBefore) (shipSnapshotFirePermission playerAfter)
@@ -954,11 +1334,22 @@ testConfiguredLocalApiHotReloadsLiveEngagement = do
   assertApprox "hot reload updates big width" 9 (shipSnapshotRenderedWidth playerAfter)
   assertEqual "hot reload updates a fresh hull to the new maximum" 200 (shipSnapshotHull playerAfter)
   assertEqual "hot reload updates small max hull" 70 (shipSnapshotMaxHull enemyAfter)
-  assertEqual "hot reload updates small hull to its new maximum" 70 (shipSnapshotHull enemyAfter)
+  assertEqual "hot reload recalculates the small hull from the damage it has taken" 45 (shipSnapshotHull enemyAfter)
   assertEqual "hot reload keeps enemy reload" (shipSnapshotReload enemyBefore) (shipSnapshotReload enemyAfter)
   advanced <- advanceLocalApiTick "advance using reloaded movement values" api
   advancedPlayer <- expectShipSnapshot "player after reloaded movement" PlayerShip advanced
   assertApprox "hot reload uses new tick seconds and acceleration" 4 (shipSnapshotCurrentSpeed advancedPlayer)
+  -- The shipped reload the opening volley started still has two ticks to run, so
+  -- the first volley the reloaded config can be judged by is the one after them.
+  _ <- advanceLocalApiTick "cool the reloaded engagement once" api
+  beforeVolley <- expectRight "observe the reloaded engagement before its volley" =<< combatApiObserveSnapshot api
+  beforeVolleyPlayer <- expectShipSnapshot "player before the reloaded volley" PlayerShip beforeVolley
+  assertEqual "the reload is on its last tick before the reloaded volley" 1 (shipSnapshotReload beforeVolleyPlayer)
+  fired <- advanceLocalApiTick "fire using the reloaded broadside tuning" api
+  firedPlayer <- expectShipSnapshot "player after the reloaded volley" PlayerShip fired
+  firedEnemy <- expectShipSnapshot "enemy after the reloaded volley" EnemyShip fired
+  assertEqual "hot reload uses the reloaded broadside damage" 5 (shipSnapshotHull firedEnemy)
+  assertEqual "hot reload uses the reloaded reload ticks" 6 (shipSnapshotReload firedPlayer)
  where
   tuneForHotReload currentConfig =
     currentConfig
@@ -974,6 +1365,9 @@ testConfiguredLocalApiHotReloadsLiveEngagement = do
           , boatConfigRenderedWidth = 9
           , boatConfigBattleSpeed = 4
           , boatConfigAcceleration = 5
+          , boatConfigBroadsideRange = 110
+          , boatConfigBroadsideDamage = 40
+          , boatConfigReloadTicks = 6
           }
       "small" -> boat {boatConfigMaxHull = 70}
       _ -> boat
@@ -1033,8 +1427,9 @@ testInvalidReloadKeepsLastValidConfigAndSnapshot = do
   assertInvalidReloadPreservesLiveEngagement "missing reload" localApi config beforeReload missing
 
 -- | The damage taken is what a hull reload recomputes the current hull from, so
--- it has to survive a clamp down and back up. Nothing fires in this issue, so
--- the damage is applied to the fixture with the domain's own accounting.
+-- it has to survive a clamp down and back up. The fixture applies that damage
+-- with the domain's own accounting, so the test stays about the clamp rather than
+-- about firing.
 testHotReloadPreservesDamageAcrossHullClamp :: IO ()
 testHotReloadPreservesDamageAcrossHullClamp = do
   config <- expectRight "load packaged config for repeated hull reload" =<< loadRuntimeCombatConfig
@@ -1157,6 +1552,75 @@ testLocalApiExposesLockedTargetAndFirePermission = do
   releasedPlayer <- expectShipSnapshot "released player snapshot" PlayerShip released
   assertEqual "the same command through the API releases the lock" Nothing (shipSnapshotLockedTarget releasedPlayer)
   assertEqual "withdrawing fire at will reaches the snapshot" False (shipSnapshotFirePermission releasedPlayer)
+
+-- | The whole rule through the local API: a volley leaves on the tick the queued
+-- order applies, withdrawing during the reload stops the volley that was coming
+-- without stopping the cooldown, and an arm order after it fires again.
+testLocalApiFiresAndWithdrawsThroughTheQueuedOrders :: IO ()
+testLocalApiFiresAndWithdrawsThroughTheQueuedOrders = do
+  (api, _) <- startLocalDuel
+  _ <- queueLocalCommand "queue player furl sails" api (SetSails PlayerShip SailsFurled)
+  _ <- queueLocalCommand "queue player lock" api (Lock PlayerShip EnemyShip)
+  _ <- queueLocalCommand "queue player fire at will" api (SetFireAtWill PlayerShip True)
+  firstVolley <- advanceLocalApiTick "advance the first API volley" api
+  playerAfterFirst <- expectShipSnapshot "player after the first API volley" PlayerShip firstVolley
+  enemyAfterFirst <- expectShipSnapshot "enemy after the first API volley" EnemyShip firstVolley
+  -- The enemy's autopilot restores cruise speed on the tick it issues its first
+  -- order, so the order that actually holds it still is the one applied next.
+  _ <- queueLocalCommand "queue enemy furl sails" api (SetSails EnemyShip SailsFurled)
+  _ <- advanceLocalApiTick "advance the pinned enemy" api
+  _ <- queueLocalCommand "queue player hold fire" api (SetFireAtWill PlayerShip False)
+  withdrawn <- advanceLocalApiTick "advance the withdrawal" api
+  playerWithdrawn <- expectShipSnapshot "player after the withdrawal" PlayerShip withdrawn
+  loaded <- advanceLocalApiTick "advance past the completing tick" api
+  loadedPlayer <- expectShipSnapshot "player on the tick the reload completes" PlayerShip loaded
+  loadedEnemy <- expectShipSnapshot "enemy on the tick the reload completes" EnemyShip loaded
+  _ <- queueLocalCommand "queue player fire at will again" api (SetFireAtWill PlayerShip True)
+  rearmed <- advanceLocalApiTick "advance the re-armed volley" api
+  rearmedPlayer <- expectShipSnapshot "player after re-arming" PlayerShip rearmed
+  rearmedEnemy <- expectShipSnapshot "enemy after re-arming" EnemyShip rearmed
+  assertEqual "the queued order fires a volley through the API" 75 (shipSnapshotHull enemyAfterFirst)
+  assertEqual "the API snapshot shows the volley's reload" reloadTicks (shipSnapshotReload playerAfterFirst)
+  assertEqual "the withdrawal is accepted during a reload" False (shipSnapshotFirePermission playerWithdrawn)
+  assertEqual "the reload reaches zero while the guns are disengaged" 0 (shipSnapshotReload loadedPlayer)
+  assertEqual "no volley leaves on the reload's completing tick once permission is withdrawn" 75 (shipSnapshotHull loadedEnemy)
+  assertEqual "re-arming after the reload reaches zero is accepted" True (shipSnapshotFirePermission rearmedPlayer)
+  assertEqual "the re-armed volley leaves through the API" 50 (shipSnapshotHull rearmedEnemy)
+
+-- | Volleys through the API until the duel ends: the winner is reported and a
+-- finished scenario stops advancing. Nothing but a volley takes a hull to zero,
+-- so this is also the API's proof that automatic fire ends a fight.
+testLocalApiReportsTerminalState :: IO ()
+testLocalApiReportsTerminalState = do
+  (api, _) <- startLocalDuel
+  _ <- queueLocalCommand "queue player furl sails" api (SetSails PlayerShip SailsFurled)
+  _ <- queueLocalCommand "queue player lock" api (Lock PlayerShip EnemyShip)
+  _ <- queueLocalCommand "queue player fire at will" api (SetFireAtWill PlayerShip True)
+  firstVolley <- advanceLocalApiTick "advance the first player volley" api
+  firstEnemy <- expectShipSnapshot "enemy after the first player volley" EnemyShip firstVolley
+  -- The enemy's autopilot restores cruise speed on the tick it issues its first
+  -- order, so the order that actually holds it still is the one applied next.
+  _ <- queueLocalCommand "queue enemy furl sails" api (SetSails EnemyShip SailsFurled)
+  finished <- advanceUntilTerminal 20 "advance the local duel to its end" api
+  player <- expectShipSnapshot "player at the end of the local duel" PlayerShip finished
+  enemy <- expectShipSnapshot "enemy at the end of the local duel" EnemyShip finished
+  afterFinished <- advanceLocalApiTick "advance a finished local scenario" api
+  assertEqual "the first volley leaves the enemy damaged" 75 (shipSnapshotHull firstEnemy)
+  assertEqual "the volleys disable the enemy" 0 (shipSnapshotHull enemy)
+  assertEqual "the API reports the player's victory" (ScenarioFinished (Winner PlayerShip)) (combatSnapshotStatus finished)
+  assertEqual "the enemy never fires: it holds no lock" 100 (shipSnapshotHull player)
+  assertEqual "a finished API scenario stops advancing" (combatSnapshotTick finished) (combatSnapshotTick afterFinished)
+  assertEqual "a finished API snapshot stays terminal" (combatSnapshotStatus finished) (combatSnapshotStatus afterFinished)
+
+-- | Advance the local API until the scenario reaches a terminal status.
+advanceUntilTerminal :: Int -> String -> CombatApi IO -> IO CombatSnapshot
+advanceUntilTerminal remaining label api = do
+  snapshot <- advanceLocalApiTick label api
+  case combatSnapshotStatus snapshot of
+    ScenarioFinished _ -> pure snapshot
+    ScenarioRunning
+      | remaining <= 0 -> die $ label <> ": the scenario did not finish before the test safety limit"
+      | otherwise -> advanceUntilTerminal (remaining - 1) label api
 
 -- | @shipFromSnapshot@ is the return leg of the read model, so a field that only
 -- travels one way is a field the round trip silently drops.
