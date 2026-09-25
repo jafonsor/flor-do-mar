@@ -5,7 +5,6 @@ module FlorDoMar.Combat.Api
   ( CombatApi (..)
   , CombatApiError (..)
   , CombatSnapshot (..)
-  , EngagementSnapshot (..)
   , ScenarioId (..)
   , ScenarioSummary (..)
   , ShipSnapshot (..)
@@ -54,7 +53,6 @@ data CombatSnapshot = CombatSnapshot
   , combatSnapshotTickSeconds :: Double
   , combatSnapshotWind :: WindSnapshot
   , combatSnapshotShips :: [ShipSnapshot]
-  , combatSnapshotEngagement :: EngagementSnapshot
   , combatSnapshotStatus :: ScenarioStatus
   }
   deriving stock (Eq, Show)
@@ -80,21 +78,32 @@ data ShipSnapshot = ShipSnapshot
   , shipSnapshotNavigationOrder :: Maybe NavigationOrder
   , shipSnapshotActiveNavigationPlan :: Maybe NavigationPlan
   , shipSnapshotMovementPhysics :: MovementPhysics
+  -- | The broadside tuning the simulation validates volleys against, travelling
+  -- with the ship exactly as 'shipSnapshotMovementPhysics' does. A client draws
+  -- the firing envelope from this record rather than joining the loaded config
+  -- by boat kind, so a config hot reload cannot make the drawn envelope and the
+  -- enforced one drift apart mid-battle.
+  , shipSnapshotBroadsideTuning :: BroadsideTuning
   , shipSnapshotMaxSpeed :: Double
   , shipSnapshotMaxHull :: Int
   , shipSnapshotHull :: Int
   , shipSnapshotRenderedLength :: Double
   , shipSnapshotRenderedWidth :: Double
-  , shipSnapshotReload :: Int
+  -- | The shared reload's remaining ticks. The total it counts down from is
+  -- published beside it, so a reload readout cannot be misread as a fraction of
+  -- the wrong denominator.
+  , shipSnapshotReloadTicksRemaining :: Int
+  , shipSnapshotReloadTicksTotal :: Int
   , shipSnapshotLockedTarget :: Maybe ShipId
   , shipSnapshotFirePermission :: Bool
-  }
-  deriving stock (Eq, Show)
-
-data EngagementSnapshot = EngagementSnapshot
-  { engagementRange :: Double
-  , engagementPlayerPortBroadside :: BroadsideCheck
-  , engagementPlayerStarboardBroadside :: BroadsideCheck
+  -- | Whether each broadside's firing envelope currently holds the locked
+  -- target — \"target inside\" in the glossary. It is geometry alone, computed
+  -- by the same predicate 'canFireBroadsideWith' uses for its range and arc
+  -- steps, so a loaded side that has been turned away and a reloading side that
+  -- still bears both read truthfully. A ship with no lock, or one whose lock
+  -- names a ship the scenario does not carry, holds nothing on either side.
+  , shipSnapshotPortHoldsTarget :: Bool
+  , shipSnapshotStarboardHoldsTarget :: Bool
   }
   deriving stock (Eq, Show)
 
@@ -123,15 +132,9 @@ combatSnapshotFromStateWithPlanning tickSeconds movementForShip broadsideTuningF
     , combatSnapshotTickSeconds = tickSeconds
     , combatSnapshotWind = windSnapshot (combatWind state)
     , combatSnapshotShips =
-        [ shipSnapshot tickSeconds movementForShip (combatPlayer state)
-        , shipSnapshot tickSeconds movementForShip (combatEnemy state)
+        [ shipSnapshot tickSeconds movementForShip broadsideTuningForShip state (combatPlayer state)
+        , shipSnapshot tickSeconds movementForShip broadsideTuningForShip state (combatEnemy state)
         ]
-    , combatSnapshotEngagement =
-        EngagementSnapshot
-          { engagementRange = pointDistance (shipPosition (combatPlayer state)) (shipPosition (combatEnemy state))
-          , engagementPlayerPortBroadside = canFireBroadsideWith broadsideTuningForShip state PlayerShip EnemyShip Port
-          , engagementPlayerStarboardBroadside = canFireBroadsideWith broadsideTuningForShip state PlayerShip EnemyShip Starboard
-          }
     , combatSnapshotStatus = combatStatus state
     }
 
@@ -142,8 +145,8 @@ windSnapshot wind =
     , windSnapshotSpeed = windSpeed wind
     }
 
-shipSnapshot :: Double -> (Ship -> MovementPhysics) -> Ship -> ShipSnapshot
-shipSnapshot tickSeconds movementForShip ship =
+shipSnapshot :: Double -> (Ship -> MovementPhysics) -> (Ship -> BroadsideTuning) -> CombatState -> Ship -> ShipSnapshot
+shipSnapshot tickSeconds movementForShip broadsideTuningForShip state ship =
   ShipSnapshot
     { shipSnapshotId = shipId ship
     , shipSnapshotBoatKind = shipBoatKind ship
@@ -159,17 +162,27 @@ shipSnapshot tickSeconds movementForShip ship =
     , shipSnapshotNavigationOrder = shipNavigationOrder ship
     , shipSnapshotActiveNavigationPlan = planActiveNavigation tickSeconds movement ship
     , shipSnapshotMovementPhysics = movement
+    , shipSnapshotBroadsideTuning = tuning
     , shipSnapshotMaxSpeed = movementMaxSpeed movement
     , shipSnapshotMaxHull = shipMaxHull ship
     , shipSnapshotHull = shipHull ship
     , shipSnapshotRenderedLength = shipRenderedLength ship
     , shipSnapshotRenderedWidth = shipRenderedWidth ship
-    , shipSnapshotReload = shipReload ship
+    , shipSnapshotReloadTicksRemaining = shipReload ship
+    , shipSnapshotReloadTicksTotal = broadsideTuningReloadTicks tuning
     , shipSnapshotLockedTarget = shipLockedTarget ship
     , shipSnapshotFirePermission = shipFirePermission ship
+    , shipSnapshotPortHoldsTarget = holdsTarget Port
+    , shipSnapshotStarboardHoldsTarget = holdsTarget Starboard
     }
  where
   movement = movementForShip ship
+  tuning = broadsideTuningForShip ship
+  lockedTarget = lockedTargetShip state ship
+  holdsTarget side =
+    case lockedTarget of
+      Just target -> broadsideGeometry tuning ship target side == EnvelopeHoldsTarget
+      Nothing -> False
 
 -- | Preview planning starts from the snapshot's actual ship state, using the
 -- same domain planner and result shape as an active navigation order.
@@ -215,11 +228,7 @@ shipFromSnapshot snapshot =
     , shipHull = shipSnapshotHull snapshot
     , shipRenderedLength = shipSnapshotRenderedLength snapshot
     , shipRenderedWidth = shipSnapshotRenderedWidth snapshot
-    , shipReload = shipSnapshotReload snapshot
+    , shipReload = shipSnapshotReloadTicksRemaining snapshot
     , shipLockedTarget = shipSnapshotLockedTarget snapshot
     , shipFirePermission = shipSnapshotFirePermission snapshot
     }
-
-pointDistance :: Point -> Point -> Double
-pointDistance from to =
-  sqrt (((pointX to - pointX from) ** 2) + ((pointY to - pointY from) ** 2))

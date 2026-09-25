@@ -24,7 +24,6 @@ import FlorDoMar.Combat
 
 data BattleScene = BattleScene
   { battleSceneShips :: [ShipMarker]
-  , battleSceneRange :: Double
   , battleSceneStatus :: ScenarioStatus
   , battleScenePlanningEnabled :: Bool
   , battleSceneDebugOverlaysEnabled :: Bool
@@ -33,6 +32,14 @@ data BattleScene = BattleScene
   }
   deriving stock (Eq, Show)
 
+-- | What the battle view draws about one ship.
+--
+-- The gunnery fields are carried straight off that ship's snapshot — its tuning
+-- record, its lock, its permission, its reload progress and its per-side
+-- target-inside verdict — because the firing envelope and the reload readout are
+-- drawn from the same values the simulation validates volleys against. The
+-- verdict in particular is not recomputed here: a client that derived the
+-- highlight from the geometry itself could disagree with the guns.
 data ShipMarker = ShipMarker
   { markerName :: Text
   , markerPosition :: Point
@@ -46,6 +53,13 @@ data ShipMarker = ShipMarker
   , markerNavigationOrder :: Maybe NavigationOrder
   , markerActiveNavigationPlan :: Maybe NavigationPlan
   , markerMaxSpeed :: Double
+  , markerBroadsideTuning :: BroadsideTuning
+  , markerLockedTarget :: Maybe ShipId
+  , markerFirePermission :: Bool
+  , markerReloadTicksRemaining :: Int
+  , markerReloadTicksTotal :: Int
+  , markerPortHoldsTarget :: Bool
+  , markerStarboardHoldsTarget :: Bool
   }
   deriving stock (Eq, Show)
 
@@ -64,7 +78,6 @@ battleSceneFromSnapshotWithNavigationGestureAndDebug :: Bool -> Bool -> Maybe Po
 battleSceneFromSnapshotWithNavigationGestureAndDebug setupIsOpen debugOverlaysEnabled hoverWaypoint navigationGesture snapshot =
   BattleScene
     { battleSceneShips = fmap shipMarker (combatSnapshotShips snapshot)
-    , battleSceneRange = engagementRange (combatSnapshotEngagement snapshot)
     , battleSceneStatus = combatSnapshotStatus snapshot
     , battleScenePlanningEnabled = navigationInputAllowed setupIsOpen (combatSnapshotStatus snapshot)
     , battleSceneDebugOverlaysEnabled = debugOverlaysEnabled
@@ -120,6 +133,13 @@ shipMarker ship =
     , markerNavigationOrder = shipSnapshotNavigationOrder ship
     , markerActiveNavigationPlan = shipSnapshotActiveNavigationPlan ship
     , markerMaxSpeed = shipSnapshotMaxSpeed ship
+    , markerBroadsideTuning = shipSnapshotBroadsideTuning ship
+    , markerLockedTarget = shipSnapshotLockedTarget ship
+    , markerFirePermission = shipSnapshotFirePermission ship
+    , markerReloadTicksRemaining = shipSnapshotReloadTicksRemaining ship
+    , markerReloadTicksTotal = shipSnapshotReloadTicksTotal ship
+    , markerPortHoldsTarget = shipSnapshotPortHoldsTarget ship
+    , markerStarboardHoldsTarget = shipSnapshotStarboardHoldsTarget ship
     }
 
 activeNavigationNodes :: BattleScene -> [RenderNode]

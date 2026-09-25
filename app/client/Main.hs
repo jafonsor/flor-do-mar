@@ -188,7 +188,7 @@ app combatConfig = do
         elClass "section" "status-grid" $ do
           shipPanel "Player" PlayerShip snapshotDynamic
           shipPanel "Enemy" EnemyShip snapshotDynamic
-          engagementPanel snapshotDynamic
+          gunneryPanel snapshotDynamic
 
         tickEvents <-
           widgetHold
@@ -308,11 +308,14 @@ shipPanel title identity snapshotDynamic =
     el "h2" $ text title
     dynText (shipLine identity <$> snapshotDynamic)
 
-engagementPanel :: Dynamic DomTimeline CombatSnapshot -> Widget x ()
-engagementPanel snapshotDynamic =
+-- | A placeholder readout of each ship's fire-control state until the gun panel
+-- arrives. It reads the snapshot and nothing else: it does not re-derive a
+-- broadside verdict, which is the snapshot's to publish.
+gunneryPanel :: Dynamic DomTimeline CombatSnapshot -> Widget x ()
+gunneryPanel snapshotDynamic =
   elClass "article" "panel" $ do
-    el "h2" $ text "Engagement"
-    dynText (engagementLine <$> snapshotDynamic)
+    el "h2" $ text "Gunnery"
+    dynText (gunneryLine <$> snapshotDynamic)
 
 shipLine :: ShipId -> CombatSnapshot -> Text
 shipLine identity snapshot =
@@ -322,24 +325,34 @@ shipLine identity snapshot =
       Text.intercalate
         " | "
         [ "Hull " <> showText (shipSnapshotHull ship)
-        , "Reload " <> showText (shipSnapshotReload ship)
         , "Heading " <> showHeading (shipSnapshotHeading ship)
         , "Target " <> showHeading (shipSnapshotTargetHeading ship)
         , "Speed " <> showRounded (shipSnapshotCurrentSpeed ship)
         , "Sails " <> showText (shipSnapshotSails ship)
         ]
 
-engagementLine :: CombatSnapshot -> Text
-engagementLine snapshot =
-  let
-    engagement = combatSnapshotEngagement snapshot
-   in
-    Text.intercalate
-      " | "
-      [ "Range " <> showRounded (engagementRange engagement)
-      , "Port " <> showText (engagementPlayerPortBroadside engagement)
-      , "Starboard " <> showText (engagementPlayerStarboardBroadside engagement)
-      ]
+gunneryLine :: CombatSnapshot -> Text
+gunneryLine snapshot =
+  Text.intercalate
+    " | "
+    [ "Player " <> shipGunneryLine PlayerShip snapshot
+    , "Enemy " <> shipGunneryLine EnemyShip snapshot
+    ]
+
+shipGunneryLine :: ShipId -> CombatSnapshot -> Text
+shipGunneryLine identity snapshot =
+  case findShipSnapshot identity snapshot of
+    Nothing -> "No ship"
+    Just ship ->
+      Text.intercalate
+        ", "
+        [ "Locked " <> maybe "none" showText (shipSnapshotLockedTarget ship)
+        , "Fire at will " <> showText (shipSnapshotFirePermission ship)
+        , "Reload "
+            <> showText (shipSnapshotReloadTicksRemaining ship)
+            <> " of "
+            <> showText (shipSnapshotReloadTicksTotal ship)
+        ]
 
 scenarioStatusText :: CombatSnapshot -> Text
 scenarioStatusText snapshot =

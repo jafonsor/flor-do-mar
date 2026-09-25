@@ -145,7 +145,7 @@ Two traps, plus two sandbox notes:
 - **`Page.captureScreenshot` does not reliably capture a WebGL canvas**, and
   `gl.readPixels` after compositing returns an empty buffer. Prefer asserting on
   the app's own state text, which the client renders as
-  `Tick N | <scenario> | Player | Hull … | Enemy | Hull … | Engagement | Range …`.
+  `Tick N | <scenario> | Player | Hull … | Enemy | Hull … | Gunnery | …`.
   That text is the cheapest ground truth for "did the simulation actually progress".
   When the *pixels* are what is in question, `cdp-canvas-picture.mjs` captures them
   reliably by asking the canvas from a microtask queued inside the frame's own task

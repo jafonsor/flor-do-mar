@@ -3,6 +3,7 @@
 
 module FlorDoMar.Combat.Domain
   ( BroadsideCheck (..)
+  , BroadsideGeometry (..)
   , BroadsideSide (..)
   , BroadsideTuning (..)
   , CombatCommand (..)
@@ -22,6 +23,7 @@ module FlorDoMar.Combat.Domain
   , Wind (..)
   , applyBroadsideDamage
   , broadsideDamage
+  , broadsideGeometry
   , broadsideRange
   , canFireBroadside
   , canFireBroadsideWith
@@ -32,6 +34,7 @@ module FlorDoMar.Combat.Domain
   , legacyMovementPhysics
   , enemyOrbitRadius
   , issueNavigationOrder
+  , lockedTargetShip
   , moveShip
   , navigationArrivalRadius
   , navigationHeadingCorrectionSeconds
@@ -222,6 +225,21 @@ data BroadsideCheck
   | TargetNotInScenario ShipId
   deriving stock (Eq, Show)
 
+-- | Where a target lies relative to one broadside's firing envelope.
+--
+-- This is the geometry half of a broadside check, and it is deliberately blind to
+-- the reload, the hulls and the scenario's status. Those are the parts of
+-- 'BroadsideCheck' that depend on *when* it is asked; the envelope itself is a
+-- property of the two hulls' positions and headings alone. Keeping the two apart
+-- is what lets a client hold a highlight steady on a side whose guns are still
+-- reloading — 'canFireBroadsideWith' is false then for a reason that has nothing
+-- to do with where the target is.
+data BroadsideGeometry
+  = EnvelopeHoldsTarget
+  | EnvelopeTargetBeyondRange Double
+  | EnvelopeTargetOutsideArc Double
+  deriving stock (Eq, Show)
+
 -- | The pre-configuration tuning used by 'caravelaDuel' and the legacy tick
 -- entry points.
 --
@@ -306,8 +324,6 @@ canFireBroadsideWith broadsideTuningForShip state attackerId targetId side =
         attacker = selectShip attackerId state
         target = selectShip targetId state
         tuning = broadsideTuningForShip attacker
-        range = distance (shipPosition attacker) (shipPosition target)
-        arcDelta = broadsideArcDelta attacker target side
        in
         if shipHull attacker <= 0
           then AttackerDisabled attackerId
@@ -318,12 +334,29 @@ canFireBroadsideWith broadsideTuningForShip state attackerId targetId side =
                 if shipReload attacker > 0
                   then BroadsideReloading (shipReload attacker)
                   else
-                    if range > broadsideTuningRange tuning
-                      then TargetOutOfRange range
-                      else
-                        if arcDelta > broadsideTuningFiringArcDegrees tuning
-                          then TargetOutsideFiringArc arcDelta
-                          else BroadsideReady
+                    case broadsideGeometry tuning attacker target side of
+                      EnvelopeHoldsTarget -> BroadsideReady
+                      EnvelopeTargetBeyondRange range -> TargetOutOfRange range
+                      EnvelopeTargetOutsideArc arcDelta -> TargetOutsideFiringArc arcDelta
+
+-- | The firing-envelope geometry of @side@ of @attacker@ against @target@:
+-- centre to centre, range first and then arc, measured exactly as
+-- 'canFireBroadsideWith' measures them against the same tuning record.
+--
+-- It is the one place that range or arc is compared, so the envelope the
+-- simulation enforces and the envelope a client draws from the snapshot cannot
+-- disagree. The reload, the hulls and the scenario's status are the caller's
+-- business: 'canFireBroadsideWith' checks them ahead of this, and the snapshot
+-- publishes this verdict on its own so a target that stays in reach keeps its
+-- highlight while the guns reload.
+broadsideGeometry :: BroadsideTuning -> Ship -> Ship -> BroadsideSide -> BroadsideGeometry
+broadsideGeometry tuning attacker target side
+  | range > broadsideTuningRange tuning = EnvelopeTargetBeyondRange range
+  | arcDelta > broadsideTuningFiringArcDegrees tuning = EnvelopeTargetOutsideArc arcDelta
+  | otherwise = EnvelopeHoldsTarget
+  where
+    range = distance (shipPosition attacker) (shipPosition target)
+    arcDelta = broadsideArcDelta attacker target side
 
 caravela :: ShipId -> Point -> Heading -> Ship
 caravela identity position heading =
@@ -376,6 +409,22 @@ canLockTarget state lockerId targetId
 scenarioContainsShip :: ShipId -> CombatState -> Bool
 scenarioContainsShip identity state =
   identity `elem` fmap shipId [combatPlayer state, combatEnemy state]
+
+-- | The ship @attacker@ has locked, when the scenario carries it and it is not
+-- @attacker@ itself.
+--
+-- This is the fire-control lookup the read model asks before it publishes a
+-- per-side verdict. A ship with no lock, a lock on a ship the scenario does not
+-- carry, and a lock on its own hull all answer 'Nothing', so none of them is an
+-- error or an accidental self-highlight: they are all \"no side holds the
+-- target\". The command path refuses the self-lock, and this keeps a state built
+-- by hand from relying on the arc maths to do it by accident.
+lockedTargetShip :: CombatState -> Ship -> Maybe Ship
+lockedTargetShip state attacker = do
+  targetId <- shipLockedTarget attacker
+  guard (targetId /= shipId attacker)
+  guard (scenarioContainsShip targetId state)
+  pure (selectShip targetId state)
 
 -- | Whether @permitted@ may be applied to the guns of @identity@.
 --
