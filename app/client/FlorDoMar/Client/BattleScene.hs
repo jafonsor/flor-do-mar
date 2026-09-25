@@ -22,6 +22,7 @@ import Control.Monad (guard)
 import Data.List (find)
 import Data.Text (Text)
 import FlorDoMar.Client.BattleInput
+import FlorDoMar.Client.GunPanel (reloadProgress)
 import FlorDoMar.Client.Render.Scene
 import FlorDoMar.Client.WebGL.Camera
 import FlorDoMar.Client.WebGL.Geometry
@@ -130,12 +131,18 @@ battleRenderScene scene =
   RenderScene
     { renderSceneCamera = battleCamera
     , renderSceneNodes =
-        fmap RenderMeshNode (concatMap shipMeshes (battleSceneShips scene))
+        concatMap (shipNodes scene) (battleSceneShips scene)
           <> activeNavigationNodes scene
           <> hoverNavigationNodes scene
           <> navigationGestureNodes scene
           <> reticleNodes scene
     }
+
+-- | Everything one ship draws: its hull and heading markers, and the firing
+-- envelopes it is currently showing.
+shipNodes :: BattleScene -> ShipMarker -> [RenderNode]
+shipNodes scene marker =
+  fmap RenderMeshNode (shipMeshes marker <> firingEnvelopeMeshes scene marker)
 
 -- | The battle view's fixed camera.
 --
@@ -419,6 +426,171 @@ lockedReticleStyle = strokeStyle reticleStrokeWidth (color 1 0.72 0.2 1)
 
 reticleStrokeWidth :: Scalar
 reticleStrokeWidth = 0.5
+
+-- | A ship's firing envelopes: one wedge per broadside, both drawn at once so
+-- the player can see which side can reach.
+--
+-- A wedge is one node per side rather than one per channel. Its fill, its
+-- outline and its colour are three channels of the same shape — the outline is
+-- always the whole envelope, the fill is the part the shared reload has reached,
+-- and the colour is the target-inside verdict and the fire permission — and the
+-- renderer's geometry upload cache is keyed by primitive name, so folding them
+-- into one node is also what keeps a name unique per ship and per side.
+firingEnvelopeMeshes :: BattleScene -> ShipMarker -> [RenderMesh]
+firingEnvelopeMeshes scene marker
+  | firingEnvelopesDrawn scene marker = fmap (firingEnvelopeMesh marker) [Port, Starboard]
+  | otherwise = []
+
+-- | When a ship's envelopes are drawn at all.
+--
+-- A lock is the rule: an unlocked ship shows nothing, which is what makes the
+-- enemy's envelopes appearing the tell that it has locked the player. On top of
+-- it, a hull that has been destroyed has no guns left to draw for, and an
+-- engagement that has finished can no longer fire, so a wedge drawn then would
+-- promise a volley the volley phase will never send. The hull is checked per
+-- ship rather than inferred from the scenario's status: today a disabled hull
+-- and a finished duel arrive together, and this rule does not depend on that.
+firingEnvelopesDrawn :: BattleScene -> ShipMarker -> Bool
+firingEnvelopesDrawn scene marker =
+  battleSceneStatus scene == ScenarioRunning
+    && markerHull marker > 0
+    && markerLockedTarget marker /= Nothing
+
+firingEnvelopeMesh :: ShipMarker -> BroadsideSide -> RenderMesh
+firingEnvelopeMesh marker side =
+  RenderMesh
+    { renderMeshName = firingEnvelopeNodeName side marker
+    , renderMeshGeometry = FiringEnvelopeGeometry (firingEnvelopeWedge marker side)
+    , renderMeshMaterial = basicMaterial (firingEnvelopeColor marker side)
+    , renderMeshTransform = firingEnvelopeTransform marker
+    }
+
+-- | The shape one wedge is drawn from: the sector the snapshot's own tuning
+-- describes, in the hull's frame, with the radius the shared reload has filled
+-- it to.
+--
+-- The range and the arc come off the marker, which carries them off the
+-- snapshot, so the drawn envelope is the one the simulation enforces. The angles
+-- are local to the hull — the node's transform applies the heading — and they
+-- are the domain's convention: the port beam is 90 degrees counter-clockwise of
+-- the heading and the starboard beam 90 the other way, each spanning the
+-- half-angle either side of it, exactly as 'broadsideHeading' measures it.
+firingEnvelopeWedge :: ShipMarker -> BroadsideSide -> SectorWedge
+firingEnvelopeWedge marker side =
+  SectorWedge
+    { sectorWedgeSector =
+        Sector
+          { sectorRadius = range
+          , sectorStartAngle = beam - halfAngle
+          , sectorEndAngle = beam + halfAngle
+          , sectorSegments = firingEnvelopeSegments halfAngle
+          }
+    , sectorWedgeFilledRadius = range * realToFrac (reloadProgress remaining total)
+    , sectorWedgeOutlineWidth = firingEnvelopeOutlineWidth
+    }
+ where
+  tuning = markerBroadsideTuning marker
+  range = realToFrac (broadsideTuningRange tuning)
+  halfAngle = realToFrac (broadsideTuningFiringArcDegrees tuning) * pi / 180
+  beam = broadsideBeamAngle side
+  remaining = markerReloadTicksRemaining marker
+  total = markerReloadTicksTotal marker
+
+-- | The beam a broadside fires along, in the hull's own frame, whose positive x
+-- axis the transform turns onto the heading.
+broadsideBeamAngle :: BroadsideSide -> Scalar
+broadsideBeamAngle side =
+  case side of
+    Port -> pi / 2
+    Starboard -> negate (pi / 2)
+
+-- | The wedge's colour: the ship's own hull colour — player blue or enemy red —
+-- the one shared highlight when this side holds the locked target, and the same
+-- colour pulled most of the way to grey while the guns are not permitted to
+-- fire.
+--
+-- It reads the marker's verdict rather than recomputing one, so the highlight
+-- and the enforced firing condition cannot disagree, and it reads the
+-- permission and the verdict rather than the reload, so the colour is
+-- independent of the fill: the fill is the geometry's radius and nothing here
+-- touches it.
+firingEnvelopeColor :: ShipMarker -> BroadsideSide -> Color
+firingEnvelopeColor marker side
+  | markerFirePermission marker = envelopeColor
+  | otherwise = desaturateColor envelopeColor
+ where
+  envelopeColor =
+    if sideHoldsTarget marker side
+      then firingEnvelopeHighlightColor
+      else baseShipColor marker
+
+sideHoldsTarget :: ShipMarker -> BroadsideSide -> Bool
+sideHoldsTarget marker side =
+  case side of
+    Port -> markerPortHoldsTarget marker
+    Starboard -> markerStarboardHoldsTarget marker
+
+-- | The wedge's own frame: at the hull, turned with the hull's heading, so the
+-- sector only has to be described relative to the beam and the geometry only
+-- re-uploads when the shape it draws actually changes.
+firingEnvelopeTransform :: ShipMarker -> Transform
+firingEnvelopeTransform marker =
+  transform
+    (vec3 (realToFrac (pointX position)) (realToFrac (pointY position)) firingEnvelopeHeight)
+    (headingRadians (markerHeading marker))
+    (vec3 1 1 1)
+ where
+  position = markerPosition marker
+
+-- | The wedge's name, unique per ship and per side because the renderer's
+-- geometry upload cache is keyed by the primitive name.
+firingEnvelopeNodeName :: BroadsideSide -> ShipMarker -> Text
+firingEnvelopeNodeName side marker =
+  meshName ("firing-envelope:" <> sideName side) marker
+
+sideName :: BroadsideSide -> Text
+sideName side =
+  case side of
+    Port -> "port"
+    Starboard -> "starboard"
+
+-- | How finely a wedge's arc is sampled: this many segments around a full turn,
+-- scaled to the arc's share of it, so a narrow arc is not coarser than a wide
+-- one and the fill and the outline are sampled at the same angles.
+firingEnvelopeSegments :: Scalar -> Int
+firingEnvelopeSegments halfAngle =
+  max 2 (ceiling (abs (2 * halfAngle) * fromIntegral firingEnvelopeSegmentsPerTurn / (2 * pi)))
+
+firingEnvelopeSegmentsPerTurn :: Int
+firingEnvelopeSegmentsPerTurn = 48
+
+firingEnvelopeOutlineWidth :: Scalar
+firingEnvelopeOutlineWidth = 0.5
+
+-- | The wedge sits above the hull rather than inside it: a ship's own z extent
+-- reaches 0.125, so a wedge at the navigation overlay heights of 0.1 to 0.2
+-- would be buried in the hull it is anchored to. It sits below the reticles at
+-- 0.3 as well, at a height of its own, so a mark on the locked ship is never
+-- drawn underneath the envelope that reached it and the two cannot z-fight.
+firingEnvelopeHeight :: Scalar
+firingEnvelopeHeight = 0.25
+
+-- | One highlight colour, shared by both ships: whichever wedge holds the locked
+-- target wears it, so "in reach" cannot be read as "this is my ship's colour".
+firingEnvelopeHighlightColor :: Color
+firingEnvelopeHighlightColor = color 1 0.93 0.35 1
+
+-- | A colour pulled most of the way to grey, for a ship whose guns are not
+-- permitted to fire. The hue survives, so the player's envelope and the enemy's
+-- stay distinguishable while both are disengaged.
+desaturateColor :: Color -> Color
+desaturateColor fill = tintColor fill wedgeGray firingEnvelopeDesaturation
+
+wedgeGray :: Color
+wedgeGray = color 0.52 0.55 0.58 1
+
+firingEnvelopeDesaturation :: Scalar
+firingEnvelopeDesaturation = 0.62
 
 shipMeshes :: ShipMarker -> [RenderMesh]
 shipMeshes marker =

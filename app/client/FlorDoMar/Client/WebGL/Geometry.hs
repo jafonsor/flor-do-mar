@@ -4,12 +4,18 @@ module FlorDoMar.Client.WebGL.Geometry
   ( Color (..)
   , Geometry3D (..)
   , Rect (..)
+  , Sector (..)
+  , SectorWedge (..)
   , Vertex2D (..)
   , Geometry2D (..)
   , color
   , rect
   , rectangleGeometry
   , ringStrokeGeometry
+  , sectorArcPoints
+  , sectorFillGeometry
+  , sectorOutlinePoints
+  , sectorWedgeGeometry
   , strokePathGeometry
   , unitCubeGeometry
   , vertex2DFloats
@@ -62,6 +68,27 @@ data Geometry2D = Geometry2D
 data Geometry3D = Geometry3D
   { geometry3DVertices :: [Vec3]
   , geometry3DIndices :: [Word16]
+  }
+  deriving stock (Eq, Show)
+
+-- | A circular sector about the local origin: a firing envelope's shape, in the
+-- frame of the hull it belongs to. The beam it is built around is measured from
+-- that frame's positive x axis, which the node's transform turns onto the hull's
+-- heading.
+data Sector = Sector
+  { sectorRadius :: Scalar
+  , sectorStartAngle :: Scalar
+  , sectorEndAngle :: Scalar
+  , sectorSegments :: Int
+  }
+  deriving stock (Eq, Show)
+
+-- | A sector drawn as one shape: the whole sector's outline, and the part of it
+-- the reload has filled out to @sectorWedgeFilledRadius@.
+data SectorWedge = SectorWedge
+  { sectorWedgeSector :: Sector
+  , sectorWedgeFilledRadius :: Scalar
+  , sectorWedgeOutlineWidth :: Scalar
   }
   deriving stock (Eq, Show)
 
@@ -179,6 +206,79 @@ ringStrokeGeometry center radius segments width =
     | segment <- [0 .. segmentCount - 1]
     , let angle = (2 * pi * fromIntegral segment) / fromIntegral segmentCount
     ]
+
+-- | The sampled arc of a sector: @segments + 1@ points from the start angle to
+-- the end angle inclusive, all at @radius@ from the local origin.
+--
+-- This is the sector's one boundary sampler, and the reason it exists is that
+-- both halves of a wedge have to come from it: the outline strokes it at the
+-- envelope's full radius and the fill fans it at whatever radius the reload has
+-- reached. A ring stroke cannot stand in for it — 'ringStrokeGeometry' hardcodes
+-- its angles from zero, so it draws full circles only — and sampling the
+-- boundary at each call site would let the fill and the outline disagree about
+-- where the envelope's edge is.
+sectorArcPoints :: Scalar -> Scalar -> Scalar -> Int -> [Vec3]
+sectorArcPoints radius startAngle endAngle segments =
+  [ vec3 (radius * cos angle) (radius * sin angle) 0
+  | step <- [0 .. steps]
+  , let angle = startAngle + ((endAngle - startAngle) * fromIntegral step / fromIntegral steps)
+  ]
+ where
+  steps = max 1 segments
+
+-- | The closed boundary of the whole sector: its apex, the sampled arc, and back
+-- to the apex, ready to be stroked as the envelope's outline.
+sectorOutlinePoints :: Sector -> [Vec3]
+sectorOutlinePoints sector =
+  apex : sectorArcPoints (sectorRadius sector) (sectorStartAngle sector) (sectorEndAngle sector) (sectorSegments sector) <> [apex]
+ where
+  apex = vec3 0 0 0
+
+-- | The part of a sector a reload has reached, as a triangle fan about the apex.
+-- A radius of zero draws nothing, which is the wedge at the instant a volley
+-- starts the shared reload.
+sectorFillGeometry :: Scalar -> Sector -> Geometry3D
+sectorFillGeometry filledRadius sector
+  | filledRadius <= 0 = Geometry3D {geometry3DVertices = [], geometry3DIndices = []}
+  | otherwise =
+      Geometry3D
+        { geometry3DVertices = apex : arcPoints
+        , geometry3DIndices = concatMap fanTriangle [0 .. length arcPoints - 2]
+        }
+ where
+  apex = vec3 0 0 0
+  arcPoints = sectorArcPoints filledRadius (sectorStartAngle sector) (sectorEndAngle sector) (sectorSegments sector)
+  fanTriangle index =
+    [ 0
+    , fromIntegral (index + 1)
+    , fromIntegral (index + 2)
+    ]
+
+-- | A firing envelope as one shape of one colour: the filled part the reload has
+-- reached, inside the outline of the whole sector at its full radius. The
+-- outline is always the full envelope, so a wedge that is only part filled still
+-- says where the guns reach.
+sectorWedgeGeometry :: SectorWedge -> Geometry3D
+sectorWedgeGeometry wedge =
+  appendGeometry
+    (sectorFillGeometry (sectorWedgeFilledRadius wedge) sector)
+    (strokePathGeometry (sectorOutlinePoints sector) (sectorWedgeOutlineWidth wedge))
+ where
+  sector = sectorWedgeSector wedge
+
+-- | Two geometries drawn as one: the second's indices are shifted past the
+-- first's vertices, so one primitive can carry both the fill and the outline of
+-- a wedge.
+appendGeometry :: Geometry3D -> Geometry3D -> Geometry3D
+appendGeometry first second =
+  Geometry3D
+    { geometry3DVertices = geometry3DVertices first <> geometry3DVertices second
+    , geometry3DIndices =
+        geometry3DIndices first
+          <> fmap (offsetIndex (length (geometry3DVertices first))) (geometry3DIndices second)
+    }
+ where
+  offsetIndex offset index = fromIntegral (offset + fromIntegral index)
 
 offsetPoint :: Vec3 -> Vec3 -> Vec3
 offsetPoint point offset =

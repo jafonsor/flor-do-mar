@@ -61,7 +61,13 @@ data RenderMesh = RenderMesh
   }
   deriving stock (Eq, Show)
 
-data GeometryRef = UnitCubeGeometry
+data GeometryRef
+  = UnitCubeGeometry
+  | -- | One broadside's firing envelope: a sector sampled in the hull's own
+    -- frame, carrying the reload's fill and the whole envelope's outline in one
+    -- shape. The browser replays it as triangles like every other primitive, so
+    -- nothing about the wire format changes for it.
+    FiringEnvelopeGeometry Geometry.SectorWedge
   deriving stock (Eq, Show)
 
 data Material = BasicMaterial
@@ -183,3 +189,4 @@ flattenNode parentMatrix node =
 
 geometryFor :: GeometryRef -> Geometry.Geometry3D
 geometryFor UnitCubeGeometry = Geometry.unitCubeGeometry
+geometryFor (FiringEnvelopeGeometry wedge) = Geometry.sectorWedgeGeometry wedge

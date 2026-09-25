@@ -105,6 +105,7 @@ executable diagnosis-hover-perf
   other-modules:
     FlorDoMar.Client.BattleInput
     FlorDoMar.Client.BattleScene
+    FlorDoMar.Client.GunPanel
     FlorDoMar.Client.Render.Scene
     FlorDoMar.Client.WebGL.Camera
     FlorDoMar.Client.WebGL.Geometry
@@ -161,6 +162,7 @@ executable scan-hover-positions
   other-modules:
     FlorDoMar.Client.BattleInput
     FlorDoMar.Client.BattleScene
+    FlorDoMar.Client.GunPanel
     FlorDoMar.Client.Render.Scene
     FlorDoMar.Client.WebGL.Camera
     FlorDoMar.Client.WebGL.Geometry

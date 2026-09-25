@@ -4,6 +4,7 @@
 module Main (main) where
 
 import Control.Monad (forM_)
+import Data.List (nub)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import FlorDoMar.Client.BattleInput
@@ -119,6 +120,17 @@ main = do
   testReticleHoverFollowsTheSnapshot
   testNavigationReleaseSplitsClickFromDrag
   testReticleRenderScene
+  testFiringEnvelopeAppearsPerLockedBroadside
+  testEnemyFiringEnvelopeAppearsWhenItLocks
+  testFiringEnvelopeMatchesTheEnforcedEnvelope
+  testFiringEnvelopeFillTracksTheSharedReload
+  testFiringEnvelopeFillAndHighlightAreIndependent
+  testFiringEnvelopeHighlightsTheSideHoldingTheTarget
+  testFiringEnvelopeBaseColoursFollowTheHulls
+  testFiringEnvelopeDesaturatesWhenTheGunsAreNotPermitted
+  testFiringEnvelopeSitsAboveTheHull
+  testFiringEnvelopeIsHiddenForFinishedAndDisabledShips
+  testShippedFiringEnvelopeFitsTheVisibleExtent
   testGunPanelReloadProgress
   testGunPanelToggleIsClickableOnlyWhenItCanAct
   testGunPanelShowsTheRequestedStateUntilATickDecidesIt
@@ -2409,6 +2421,11 @@ testInitialBattleRenderScene = do
   assertApproxScalar "render camera zoom" 0.6 (cameraZoom camera)
   assertEqual "render mesh count" 6 (length meshes)
   assertEqual "ship nodes flatten to render primitives" 6 (length primitives)
+  -- The count is six rather than eight because neither ship is locked at the
+  -- start of the duel: a firing envelope is drawn only for a ship with a
+  -- fire-control solution, and that it adds exactly two primitives when one has
+  -- it is pinned by 'testFiringEnvelopeAppearsPerLockedBroadside'.
+  assertEqual "the opening scene draws no firing envelope" [] (firingEnvelopeNames renderScene)
   assertMesh
     "initial player ship"
     "ship:player"
@@ -2944,6 +2961,454 @@ testReticleRenderScene = do
   assertEqual "the locked ring sits above the hull rather than inside it" True (vec3Z (transformPosition lockedTransform) > hullTop)
   assertApproxScalar "both reticles sit at the same height" (vec3Z (transformPosition hoverTransform)) (vec3Z (transformPosition lockedTransform))
 
+-- | A wedge is drawn for a ship that holds a fire-control solution and for no
+-- other, one per broadside, and each wedge's primitive name is unique per ship
+-- and per side: the renderer's geometry upload cache is keyed by that name, so
+-- a duplicate would hand one wedge's geometry to another ship's node.
+testFiringEnvelopeAppearsPerLockedBroadside :: IO ()
+testFiringEnvelopeAppearsPerLockedBroadside = do
+  let
+    unlockedScene = battleRenderSceneFromSnapshot (panelSnapshotWith id)
+    playerLockedScene = battleRenderSceneFromSnapshot (panelSnapshotWith (playerLockedOnTheEnemy))
+    enemyLockedScene = battleRenderSceneFromSnapshot (panelSnapshotWith (enemyLockedOnThePlayer))
+    bothLockedScene = battleRenderSceneFromSnapshot (panelSnapshotWith (enemyLockedOnThePlayer . playerLockedOnTheEnemy))
+    everyPrimitiveName = fmap renderPrimitiveName (renderScenePrimitives bothLockedScene)
+  assertEqual "an unlocked ship draws no firing envelope" [] (firingEnvelopeNames unlockedScene)
+  assertEqual
+    "a locked ship draws one wedge per broadside"
+    ["firing-envelope:port:player", "firing-envelope:starboard:player"]
+    (firingEnvelopeNames playerLockedScene)
+  assertEqual
+    "the enemy's wedges appear once it has locked the player"
+    ["firing-envelope:port:enemy", "firing-envelope:starboard:enemy"]
+    (firingEnvelopeNames enemyLockedScene)
+  assertEqual
+    "both ships locked draws every wedge"
+    [ "firing-envelope:port:player"
+    , "firing-envelope:starboard:player"
+    , "firing-envelope:port:enemy"
+    , "firing-envelope:starboard:enemy"
+    ]
+    (firingEnvelopeNames bothLockedScene)
+  assertEqual
+    "one locked ship draws two wedges beside its hull and issue 06's reticle"
+    9
+    (length (renderScenePrimitives playerLockedScene))
+  assertEqual
+    "every wedge name is unique across both ships and both sides"
+    4
+    (length (nub (firingEnvelopeNames bothLockedScene)))
+  assertEqual
+    "no two primitives of the whole scene share a name"
+    (length everyPrimitiveName)
+    (length (nub everyPrimitiveName))
+
+-- | The enemy's wedges are its own lock made visible: they appear on the tick
+-- the autopilot's lock command lands, read out of a snapshot the simulation
+-- published rather than a state this test assembled. Until then nothing on the
+-- canvas says the player is being ranged.
+testEnemyFiringEnvelopeAppearsWhenItLocks :: IO ()
+testEnemyFiringEnvelopeAppearsWhenItLocks = do
+  (api, start) <- startLocalDuel
+  assertEqual
+    "the duel opens with no wedge on either ship"
+    []
+    (firingEnvelopeNames (battleRenderSceneFromSnapshot start))
+  locked <- advanceUntilTheEnemyLocks (enemyLockDelayTicks + 2) api
+  enemy <- expectShipSnapshot "the enemy's own lock" EnemyShip locked
+  assertEqual
+    "the enemy locked the player through its own command"
+    (Just PlayerShip)
+    (shipSnapshotLockedTarget enemy)
+  assertEqual
+    "the enemy's wedges are drawn on the tick it locks"
+    ["firing-envelope:port:enemy", "firing-envelope:starboard:enemy"]
+    (firingEnvelopeNames (battleRenderSceneFromSnapshot locked))
+
+-- | The drawn envelope and the enforced envelope are the same area.
+--
+-- The wedge's own geometry is read out of the scene and put through its node's
+-- matrix, so the bearings below are what the canvas draws rather than what this
+-- test believes should be drawn. Points on that drawn arc then become target
+-- positions for the domain's own 'broadsideGeometry' — the predicate the volley
+-- phase fires on — and the agreement is checked from both sides: every
+-- direction inside the drawn arc holds the target, directions just past either
+-- end of it are outside the arc, and the drawn reach's own direction just past
+-- its end is beyond range. A wedge drawn on the wrong beam, with the heading's
+-- sign flipped, or from a stale tuning would render exactly as happily as the
+-- right one, and only this agreement with the domain tells them apart.
+testFiringEnvelopeMatchesTheEnforcedEnvelope :: IO ()
+testFiringEnvelopeMatchesTheEnforcedEnvelope = do
+  let
+    state = playerReadyToFire
+    snapshot = combatSnapshotFromState caravelaDuelScenario state
+    scene = battleRenderSceneFromSnapshot snapshot
+    player = combatPlayer state
+    centre = shipPosition player
+  playerSnapshot <- expectShipSnapshot "envelope geometry player" PlayerShip snapshot
+  let
+    tuning = shipSnapshotBroadsideTuning playerSnapshot
+    range = broadsideTuningRange tuning
+    halfAngle = broadsideTuningFiringArcDegrees tuning
+  assertEqual "the drawn heading is the snapshot's own" (shipSnapshotHeading playerSnapshot) (shipHeading player)
+  forM_
+    [ ("firing-envelope:port:player", Port, 90)
+    , ("firing-envelope:starboard:player", Starboard, -90)
+    ]
+    $ \(name, side, beamDegrees) -> do
+      let label = Text.unpack name
+      wedge <- firingEnvelopeShapeOf label =<< expectFiringEnvelope label name scene
+      vertices <- primitiveWorldVertices name scene
+      let
+        outlineHalf = realToFrac (sectorWedgeOutlineWidth wedge) / 2
+        offsets = fmap (worldOffset centre) vertices
+        reach = maximum (fmap fst offsets)
+        arc = [bearing | (distance, bearing) <- offsets, distance >= reach - 0.5]
+        arcStart = minimum arc
+        arcEnd = maximum arc
+        beam = headingDegrees (shipHeading player) + beamDegrees
+        -- The outline is stroked on the boundary's centre line and the arc is
+        -- sampled, so the drawn extremes sit within a stroke's half width and a
+        -- chord's sag of the arc the domain measures. Both are under half a
+        -- degree at this radius, which is what the tolerance below allows for.
+        inward = 1
+        insets = [arcStart + inward, arcEnd - inward]
+      assertApproxWithin
+        (label <> " reaches the snapshot's range, stroked half a width past it")
+        drawnEnvelopeTolerance
+        (range + outlineHalf)
+        reach
+      assertApproxWithin
+        (label <> " starts at the beam less the snapshot's half-angle")
+        0.75
+        0
+        (signedAngleDelta (beam - halfAngle) arcStart)
+      assertApproxWithin
+        (label <> " ends at the beam plus the snapshot's half-angle")
+        0.75
+        0
+        (signedAngleDelta (beam + halfAngle) arcEnd)
+      forM_ [0 .. 8 :: Int] $ \step -> do
+        let
+          bearing =
+            minimum insets
+              + ((maximum insets - minimum insets) * fromIntegral step / 8)
+        assertEqual
+          (label <> " holds a target on its drawn arc at " <> show bearing <> " degrees")
+          "holds target"
+          (envelopeVerdict (broadsideGeometry tuning player (targetShipAt (pointAt centre (reach * 0.98) bearing)) side))
+      forM_
+        [("past the start of its arc", arcStart - 2), ("past the end of its arc", arcEnd + 2)]
+        $ \(where_, bearing) ->
+          assertEqual
+            (label <> " refuses a target " <> where_)
+            "outside arc"
+            (envelopeVerdict (broadsideGeometry tuning player (targetShipAt (pointAt centre (reach * 0.5) bearing)) side))
+      assertEqual
+        (label <> " refuses a target past its reach")
+        "beyond range"
+        (envelopeVerdict (broadsideGeometry tuning player (targetShipAt (pointAt centre (reach * 1.05) ((arcStart + arcEnd) / 2))) side))
+
+-- | The wedge's fill is the shared reload's progress, drawn identically on both
+-- of a ship's wedges, and the outline is the whole envelope whatever the fill
+-- has reached. The fill reads the same function over the same pair of counters
+-- the reload circle reads, so the two readouts of one reload cannot disagree.
+testFiringEnvelopeFillTracksTheSharedReload :: IO ()
+testFiringEnvelopeFillTracksTheSharedReload = do
+  let
+    range = broadsideTuningRange legacyBroadsideTuning
+    total = broadsideTuningReloadTicks legacyBroadsideTuning
+    sceneAt remaining =
+      battleRenderSceneFromSnapshot $
+        panelSnapshotWith (withPlayerShip (\ship -> ship {shipLockedTarget = Just EnemyShip, shipReload = remaining}))
+    centre = shipPosition (combatPlayer caravelaDuel)
+  forM_ [0 .. total] $ \remaining -> do
+    let
+      label = "reload " <> show remaining <> " of " <> show total
+      expected = range * reloadProgress remaining total
+    portWedge <- expectFiringEnvelope label "firing-envelope:port:player" (sceneAt remaining)
+    starboardWedge <- expectFiringEnvelope label "firing-envelope:starboard:player" (sceneAt remaining)
+    portShape <- firingEnvelopeShapeOf label portWedge
+    starboardShape <- firingEnvelopeShapeOf label starboardWedge
+    vertices <- primitiveWorldVertices "firing-envelope:port:player" (sceneAt remaining)
+    let drawnRadii = fmap (fst . worldOffset centre) vertices
+    assertApproxWithin
+      (label <> ": the port wedge fills to the reload's progress")
+      drawnEnvelopeTolerance
+      expected
+      (realToFrac (sectorWedgeFilledRadius portShape))
+    assertEqual
+      (label <> ": both wedges of one ship show the same fill")
+      (sectorWedgeFilledRadius portShape)
+      (sectorWedgeFilledRadius starboardShape)
+    assertApproxWithin
+      (label <> ": the outline is the whole envelope whatever the fill")
+      drawnEnvelopeTolerance
+      (range + realToFrac (sectorWedgeOutlineWidth portShape) / 2)
+      (maximum drawnRadii)
+    -- A wedge the reload has just emptied has no fill geometry to carry, so
+    -- this part of the check starts at the first tick of the reload.
+    if expected <= 0
+      then pure ()
+      else
+        assertEqual
+          (label <> ": the drawn geometry carries the fill's own radius")
+          True
+          (any (\radius -> abs (radius - expected) < 0.01) drawnRadii)
+
+-- | Fill and highlight are independent channels on one shape: all four
+-- combinations of "the guns are loaded or still reloading" and "the target lies
+-- inside this wedge or not" are produced here, so neither reading can be the
+-- other's. The issue names two of them in particular — a full unhighlighted
+-- wedge and a part-filled highlighted one — and both are in this square.
+testFiringEnvelopeFillAndHighlightAreIndependent :: IO ()
+testFiringEnvelopeFillAndHighlightAreIndependent = do
+  let
+    range = broadsideTuningRange legacyBroadsideTuning
+    total = broadsideTuningReloadTicks legacyBroadsideTuning
+    partial = total - 1
+    enemyAhead = Point 0 80
+    enemyAstern = Point 0 (-80)
+    duelWith remaining enemyPosition =
+      withEnemyShip (\ship -> ship {shipPosition = enemyPosition}) $
+        withPlayerShip (\ship -> ship {shipReload = remaining}) playerReadyToFire
+    portWedgeOf label state = do
+      let scene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario state)
+      wedge <- expectFiringEnvelope label "firing-envelope:port:player" scene
+      shape <- firingEnvelopeShapeOf label wedge
+      pure (realToFrac (sectorWedgeFilledRadius shape), materialColor (renderMeshMaterial wedge))
+  (loadedUnlitFill, loadedUnlitColor) <- portWedgeOf "loaded, target turned away" (duelWith 0 enemyAstern)
+  (loadedLitFill, loadedLitColor) <- portWedgeOf "loaded, target inside" (duelWith 0 enemyAhead)
+  (partialUnlitFill, partialUnlitColor) <- portWedgeOf "reloading, target turned away" (duelWith partial enemyAstern)
+  (partialLitFill, partialLitColor) <- portWedgeOf "reloading, target inside" (duelWith partial enemyAhead)
+  assertApproxWithin "a loaded wedge is full" drawnEnvelopeTolerance range loadedUnlitFill
+  assertEqual "a full wedge is unhighlighted while the target is turned away" playerBlueColor loadedUnlitColor
+  assertEqual "and highlighted while the target is inside it" highlightColor loadedLitColor
+  assertApproxWithin
+    "a reloading wedge is filled only to the reload's progress"
+    drawnEnvelopeTolerance
+    (range * reloadProgress partial total)
+    partialLitFill
+  assertEqual "a part-filled wedge can be highlighted" highlightColor partialLitColor
+  assertEqual "and an equally part-filled wedge is unhighlighted when turned away" playerBlueColor partialUnlitColor
+  assertEqual
+    "the highlight changes no radius"
+    (loadedUnlitFill, partialUnlitFill)
+    (loadedLitFill, partialLitFill)
+  assertEqual
+    "the reload changes no colour"
+    (loadedUnlitColor, loadedLitColor)
+    (partialUnlitColor, partialLitColor)
+
+-- | The highlight is the per-side verdict the snapshot publishes and nothing
+-- else — the client draws it, it never recomputes it — so the wedge that is lit
+-- is exactly the wedge the guns would fire from, and only that one when only
+-- one side holds the target. The colour is one shared highlight, not a
+-- per-ship one: whichever wedge is lit, it is lit the same way.
+testFiringEnvelopeHighlightsTheSideHoldingTheTarget :: IO ()
+testFiringEnvelopeHighlightsTheSideHoldingTheTarget = do
+  let
+    enemyAhead = playerReadyToFire
+    enemyAstern =
+      playerReadyToFire
+        { combatEnemy = (combatEnemy playerReadyToFire) {shipPosition = Point 0 (-80)}
+        }
+    bothFiringBack =
+      withEnemyShip (\ship -> ship {shipLockedTarget = Just PlayerShip, shipFirePermission = True}) $
+        playerReadyToFire
+    portHoldsScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario enemyAhead)
+    starboardHoldsScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario enemyAstern)
+    bothHoldingScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario bothFiringBack)
+  portWhenPortHolds <- firingEnvelopeColorOf "port holds: port" "firing-envelope:port:player" portHoldsScene
+  starboardWhenPortHolds <- firingEnvelopeColorOf "port holds: starboard" "firing-envelope:starboard:player" portHoldsScene
+  portWhenStarboardHolds <- firingEnvelopeColorOf "starboard holds: port" "firing-envelope:port:player" starboardHoldsScene
+  starboardWhenStarboardHolds <- firingEnvelopeColorOf "starboard holds: starboard" "firing-envelope:starboard:player" starboardHoldsScene
+  playerHolding <- firingEnvelopeColorOf "both hold: player" "firing-envelope:port:player" bothHoldingScene
+  enemyHolding <- firingEnvelopeColorOf "both hold: enemy" "firing-envelope:port:enemy" bothHoldingScene
+  assertColor "the wedge holding the target wears the highlight" highlightColor portWhenPortHolds
+  assertColor "the wedge that does not hold it keeps the ship's own blue" playerBlueColor starboardWhenPortHolds
+  assertColor "the other side's verdict lights the other wedge" highlightColor starboardWhenStarboardHolds
+  assertColor "and leaves the first wedge in the ship's own blue" playerBlueColor portWhenStarboardHolds
+  assertColor "both ships' held wedges wear the one shared highlight" highlightColor playerHolding
+  assertColor "the enemy's held wedge wears that same colour" playerHolding enemyHolding
+
+-- | The player's envelope and the enemy's do not look alike, because steering
+-- out of one and shooting with the other are the two halves of the mechanic.
+-- Both ships are locked and out of each other's reach here, so neither wedge is
+-- highlighted and the base colours are what is being compared.
+testFiringEnvelopeBaseColoursFollowTheHulls :: IO ()
+testFiringEnvelopeBaseColoursFollowTheHulls = do
+  let
+    outOfReach =
+      withEnemyShip (\ship -> ship {shipPosition = Point 0 500, shipLockedTarget = Just PlayerShip, shipFirePermission = True}) $
+        playerReadyToFire
+    scene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario outOfReach)
+  playerWedge <- firingEnvelopeColorOf "player's base wedge" "firing-envelope:port:player" scene
+  enemyWedge <- firingEnvelopeColorOf "enemy's base wedge" "firing-envelope:port:enemy" scene
+  assertColor "the player's wedge wears the player's hull blue" playerBlueColor playerWedge
+  assertColor "the enemy's wedge wears the enemy's hull red" enemyRedColor enemyWedge
+  assertEqual "the two ships' envelopes do not look alike" True (playerWedge /= enemyWedge)
+
+-- | A ship whose guns are not permitted draws its envelopes desaturated, and
+-- that treatment is a channel of its own: the fill and the highlight are
+-- untouched by it, so a disengaged wedge still says where the guns reach and
+-- which way the target lies, and only says that nothing will leave them. The
+-- hue survives the desaturation, so the two ships stay told apart while both
+-- are disengaged.
+testFiringEnvelopeDesaturatesWhenTheGunsAreNotPermitted :: IO ()
+testFiringEnvelopeDesaturatesWhenTheGunsAreNotPermitted = do
+  let
+    range = broadsideTuningRange legacyBroadsideTuning
+    total = broadsideTuningReloadTicks legacyBroadsideTuning
+    armedState =
+      withPlayerShip (\ship -> ship {shipReload = total - 1}) playerReadyToFire
+    disengagedState = withPlayerShip (\ship -> ship {shipFirePermission = False}) armedState
+    disengagedOutOfReach =
+      withEnemyShip (\ship -> ship {shipPosition = Point 0 500, shipLockedTarget = Just PlayerShip, shipFirePermission = False}) $
+        withPlayerShip (\ship -> ship {shipFirePermission = False}) (playerLockedOnTheEnemy caravelaDuel)
+    armedScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario armedState)
+    disengagedScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario disengagedState)
+    quietScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario disengagedOutOfReach)
+    partway = range * reloadProgress (total - 1) total
+  armedPort <- firingEnvelopeColorOf "armed port" "firing-envelope:port:player" armedScene
+  armedStarboard <- firingEnvelopeColorOf "armed starboard" "firing-envelope:starboard:player" armedScene
+  disengagedPort <- firingEnvelopeColorOf "disengaged port" "firing-envelope:port:player" disengagedScene
+  disengagedStarboard <- firingEnvelopeColorOf "disengaged starboard" "firing-envelope:starboard:player" disengagedScene
+  disengagedPlayerBase <- firingEnvelopeColorOf "disengaged player base" "firing-envelope:port:player" quietScene
+  disengagedEnemyBase <- firingEnvelopeColorOf "disengaged enemy base" "firing-envelope:port:enemy" quietScene
+  assertColor "an armed wedge holding the target wears the highlight" highlightColor armedPort
+  assertColor "a disengaged wedge holding the target is that highlight pulled to grey" (color 0.7024 0.6944 0.4926 1) disengagedPort
+  assertColor "an armed wedge off the target wears the ship's blue" playerBlueColor armedStarboard
+  assertColor "a disengaged wedge off the target is that blue pulled to grey" (color 0.3984 0.626 0.7206 1) disengagedStarboard
+  assertEqual "the desaturated highlight is not the highlight" True (disengagedPort /= armedPort)
+  assertEqual "the desaturated wedge is not the ship's own colour" True (disengagedStarboard /= armedStarboard)
+  assertEqual
+    "desaturation leaves the two ships' envelopes distinguishable"
+    True
+    (disengagedPlayerBase /= disengagedEnemyBase)
+  disengagedPortShape <- firingEnvelopeShapeOf "disengaged port" =<< expectFiringEnvelope "disengaged port" "firing-envelope:port:player" disengagedScene
+  armedPortShape <- firingEnvelopeShapeOf "armed port" =<< expectFiringEnvelope "armed port" "firing-envelope:port:player" armedScene
+  disengagedStarboardShape <- firingEnvelopeShapeOf "disengaged starboard" =<< expectFiringEnvelope "disengaged starboard" "firing-envelope:starboard:player" disengagedScene
+  armedStarboardShape <- firingEnvelopeShapeOf "armed starboard" =<< expectFiringEnvelope "armed starboard" "firing-envelope:starboard:player" armedScene
+  assertApproxWithin
+    "the fill is still the reload's progress while disengaged"
+    drawnEnvelopeTolerance
+    partway
+    (realToFrac (sectorWedgeFilledRadius disengagedPortShape))
+  assertEqual
+    "disengaging does not touch the fill of the held wedge"
+    (sectorWedgeFilledRadius armedPortShape)
+    (sectorWedgeFilledRadius disengagedPortShape)
+  assertEqual
+    "disengaging does not touch the fill of the other wedge either"
+    (sectorWedgeFilledRadius armedStarboardShape)
+    (sectorWedgeFilledRadius disengagedStarboardShape)
+
+-- | A wedge and the two reticles have to share the canvas without either being
+-- buried: a ship's own z extent reaches 0.125, so a wedge at the navigation
+-- overlay heights of 0.1 to 0.2 would be inside the hull it is anchored to, and
+-- one at the reticles' own 0.3 would fight them for the same depth.
+testFiringEnvelopeSitsAboveTheHull :: IO ()
+testFiringEnvelopeSitsAboveTheHull = do
+  let
+    scene = battleRenderSceneFromSnapshot (panelSnapshotWith (enemyLockedOnThePlayer . playerLockedOnTheEnemy))
+  playerHull <- expectMesh "ship:player" scene
+  enemyHull <- expectMesh "ship:enemy" scene
+  (reticleTransform, _, _) <- expectRingStrokeStyle "locked-reticle:enemy" scene
+  let
+    hullTop mesh = vec3Z (transformPosition (renderMeshTransform mesh)) + (vec3Z (transformScale (renderMeshTransform mesh)) / 2)
+    reticleHeight = vec3Z (transformPosition reticleTransform)
+    placement mesh = vec3Z (transformPosition (renderMeshTransform mesh))
+  assertApproxScalar "the player's hull top is what a wedge has to clear" 0.125 (hullTop playerHull)
+  assertApproxScalar "the enemy's hull top is the same" 0.125 (hullTop enemyHull)
+  assertApproxScalar "issue 06's reticle height is untouched" 0.3 reticleHeight
+  forM_ (firingEnvelopeNames scene) $ \name -> do
+    wedge <- expectMesh name scene
+    let label = Text.unpack name
+    assertApproxScalar (label <> " has one pinned height") 0.25 (placement wedge)
+    assertEqual (label <> " is drawn above the hull") True (placement wedge > hullTop playerHull)
+    assertEqual (label <> " is drawn above the hull it belongs to") True (placement wedge > hullTop enemyHull)
+    assertEqual (label <> " is not at the reticles' height") True (placement wedge /= reticleHeight)
+    assertEqual (label <> " is drawn below the reticles, so a mark is never under it") True (placement wedge < reticleHeight)
+  primitive <- expectRenderPrimitive "firing-envelope:port:player" scene
+  assertEqual
+    "wedge geometry stays flat before its transform"
+    True
+    (all ((== 0) . vec3Z) (geometry3DVertices (renderPrimitiveGeometry primitive)))
+
+-- | The two states a lock alone does not earn a wedge in: an engagement that
+-- has finished, whose volley phase no longer runs, and a hull that has been
+-- destroyed. A lit wedge there would promise a volley nothing will send, so
+-- neither is drawn — and the other ship's envelopes go on being drawn, because
+-- the rule is the ship's own state rather than the scene's.
+testFiringEnvelopeIsHiddenForFinishedAndDisabledShips :: IO ()
+testFiringEnvelopeIsHiddenForFinishedAndDisabledShips = do
+  let
+    bothLocked = enemyLockedOnThePlayer (playerLockedOnTheEnemy caravelaDuel)
+    runningScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario bothLocked)
+    finishedScene =
+      battleRenderSceneFromSnapshot $
+        combatSnapshotFromState caravelaDuelScenario (bothLocked {combatStatus = ScenarioFinished (Winner PlayerShip)})
+    disabledScene =
+      battleRenderSceneFromSnapshot $
+        combatSnapshotFromState caravelaDuelScenario (withPlayerShip (\ship -> ship {shipHull = 0}) bothLocked)
+  assertEqual "a running engagement draws a locked ship's wedges" 4 (length (firingEnvelopeNames runningScene))
+  assertEqual "a finished engagement draws no firing envelope at all" [] (firingEnvelopeNames finishedScene)
+  assertEqual
+    "a destroyed hull draws no wedge, and the ship still afloat keeps its own"
+    ["firing-envelope:port:enemy", "firing-envelope:starboard:enemy"]
+    (firingEnvelopeNames disabledScene)
+
+-- | The zoom decision and the envelope drawing are verified together: at the
+-- shipped range and the shipped zoom, the whole of the player's
+-- engagement-facing envelope — the geometry the scene actually draws, not a
+-- sector recomputed here — is inside the visible world. The visible extent is
+-- 'visibleBounds' off the battle camera, so it carries the camera's own zoom.
+--
+-- The shipped duel's starting geometry has the player's port side facing the
+-- enemy, which is the side this checks. The outward side is the one issue 03
+-- recorded as hanging off the canvas, and it is pinned here from the drawn
+-- geometry for the same reason: at 0.6 the world runs from -35 to 115 while the
+-- player's own outward envelope reaches 48 units south of its hull.
+testShippedFiringEnvelopeFitsTheVisibleExtent :: IO ()
+testShippedFiringEnvelopeFitsTheVisibleExtent = do
+  config <- expectRight "load packaged config for the drawn envelope's extent" =<< loadRuntimeCombatConfig
+  let
+    engagement = configuredDefaultEngagement config
+    player = combatPlayer engagement
+    enemy = combatEnemy engagement
+    tuning = broadsideTuningForShip config player
+    locked = engagement {combatPlayer = player {shipLockedTarget = Just EnemyShip}}
+    snapshot = combatSnapshotFromStateWith (broadsideTuningForShip config) caravelaDuelScenario locked
+    scene = battleRenderSceneFromSnapshot snapshot
+    extent = visibleBounds battleCamera
+  assertEqual "the duel's engagement-facing side is its port" Port (sideFacing player enemy)
+  facingVertices <- primitiveWorldVertices "firing-envelope:port:player" scene
+  outwardVertices <- primitiveWorldVertices "firing-envelope:starboard:player" scene
+  let
+    facing = drawnBounds facingVertices
+    outward = drawnBounds outwardVertices
+  assertInsideExtent "the player's drawn engagement-facing envelope" facing extent
+  assertBoundsApprox
+    "the drawn envelope is the domain's sector"
+    drawnEnvelopeTolerance
+    (broadsideBounds player tuning Port)
+    facing
+  assertApproxWithin
+    "the drawn envelope reaches the shipped range"
+    drawnEnvelopeTolerance
+    (broadsideTuningRange tuning + 0.25)
+    (boundsMaxY facing)
+  assertEqual
+    "the outward envelope is the side that hangs off the canvas"
+    True
+    (boundsMinY outward < boundsMinY extent)
+  assertApproxWithin
+    "the outward envelope hangs the 13 units issue 03 recorded"
+    drawnEnvelopeTolerance
+    (boundsMinY extent - 13)
+    (boundsMinY outward)
+
 -- | The reload circle is reload progress: empty at the volley that started the
 -- reload, full when the guns are loaded. Disengaging does not touch it, because
 -- the guns reload whether or not they are permitted to fire — so the sweep runs
@@ -3060,6 +3525,153 @@ testGunPanelLockControlNeedsALockableTarget = do
 -- units. Every reticle test starts from this one number.
 expectedReticleRadius :: Double
 expectedReticleRadius = screenReticleRadius battleCamera battleCanvasSize
+
+-- | The one shared highlight, and the two hull colours the wedges are built
+-- from, as literals: the palette is the point of them, so a test that read them
+-- off the module would not check that they are the hull's own.
+highlightColor :: Color
+highlightColor = color 1 0.93 0.35 1
+
+playerBlueColor :: Color
+playerBlueColor = color 0.2 0.75 0.95 1
+
+enemyRedColor :: Color
+enemyRedColor = color 0.95 0.34 0.24 1
+
+-- | The duel with the player's guns pointed at the enemy.
+playerLockedOnTheEnemy :: CombatState -> CombatState
+playerLockedOnTheEnemy = withPlayerShip (\ship -> ship {shipLockedTarget = Just EnemyShip})
+
+-- | The duel with the enemy's guns pointed at the player.
+enemyLockedOnThePlayer :: CombatState -> CombatState
+enemyLockedOnThePlayer = withEnemyShip (\ship -> ship {shipLockedTarget = Just PlayerShip})
+
+withEnemyShip :: (Ship -> Ship) -> CombatState -> CombatState
+withEnemyShip change state = state {combatEnemy = change (combatEnemy state)}
+
+-- | Advance the local API until the enemy's own lock appears in the snapshot,
+-- and report the snapshot it appeared on.
+advanceUntilTheEnemyLocks :: Int -> CombatApi IO -> IO CombatSnapshot
+advanceUntilTheEnemyLocks remaining api
+  | remaining <= 0 = die "the enemy never locked the player before the test safety limit"
+  | otherwise = do
+      snapshot <- advanceLocalApiTick "advance the duel until the enemy locks" api
+      enemy <- expectShipSnapshot "enemy waiting for its lock" EnemyShip snapshot
+      if shipSnapshotLockedTarget enemy == Just PlayerShip
+        then pure snapshot
+        else advanceUntilTheEnemyLocks (remaining - 1) api
+
+-- | The firing envelopes a scene draws, in draw order.
+firingEnvelopeNames :: RenderScene -> [Text]
+firingEnvelopeNames scene =
+  [ renderMeshName mesh
+  | mesh <- renderSceneMeshes scene
+  , firingEnvelopePrefix `Text.isPrefixOf` renderMeshName mesh
+  ]
+
+firingEnvelopePrefix :: Text
+firingEnvelopePrefix = "firing-envelope"
+
+-- | The one mesh a scene draws under a wedge's name.
+expectFiringEnvelope :: String -> Text -> RenderScene -> IO RenderMesh
+expectFiringEnvelope label name scene =
+  case filter ((== name) . renderMeshName) (renderSceneMeshes scene) of
+    [mesh] -> pure mesh
+    meshes -> die $ label <> ": expected one firing envelope " <> show name <> ", got " <> show (length meshes)
+
+-- | The colour a wedge's node draws it in.
+firingEnvelopeColorOf :: String -> Text -> RenderScene -> IO Color
+firingEnvelopeColorOf label name scene =
+  materialColor . renderMeshMaterial <$> expectFiringEnvelope label name scene
+
+-- | The shape a wedge's node is drawn from.
+firingEnvelopeShapeOf :: String -> RenderMesh -> IO SectorWedge
+firingEnvelopeShapeOf label mesh =
+  case renderMeshGeometry mesh of
+    FiringEnvelopeGeometry wedge -> pure wedge
+    UnitCubeGeometry -> die $ label <> ": expected a firing envelope, got a unit cube"
+
+-- | One named primitive's drawn geometry in world units, with the node's own
+-- matrix applied the way the renderer applies it.
+primitiveWorldVertices :: Text -> RenderScene -> IO [Vec3]
+primitiveWorldVertices name scene = do
+  primitive <- expectRenderPrimitive name scene
+  pure
+    [ transformPoint3 (renderPrimitiveWorldMatrix primitive) vertex
+    | vertex <- geometry3DVertices (renderPrimitiveGeometry primitive)
+    ]
+
+-- | Where a drawn world point lies from a ship: the distance and the bearing in
+-- degrees the domain's own envelope check measures it by.
+worldOffset :: Point -> Vec3 -> (Double, Double)
+worldOffset from point =
+  ( pointDistance from target
+  , bearingDegrees from target
+  )
+ where
+  target =
+    Point
+      { pointX = realToFrac (vec3X point)
+      , pointY = realToFrac (vec3Y point)
+      }
+
+-- | A point at a bearing and radius from a centre, the reverse of 'worldOffset'.
+pointAt :: Point -> Double -> Double -> Point
+pointAt centre radius degrees =
+  Point
+    { pointX = pointX centre + radius * cos radians
+    , pointY = pointY centre + radius * sin radians
+    }
+ where
+  radians = toRadians degrees
+
+-- | A target ship standing at a point, for asking the domain's own envelope
+-- predicate about it. Only the position matters to 'broadsideGeometry'.
+targetShipAt :: Point -> Ship
+targetShipAt position = (combatEnemy caravelaDuel) {shipPosition = position}
+
+-- | The domain's envelope verdict, as a word, so an assertion about it reads as
+-- the property being checked rather than as a constructor.
+envelopeVerdict :: BroadsideGeometry -> Text
+envelopeVerdict geometry =
+  case geometry of
+    EnvelopeHoldsTarget -> "holds target"
+    EnvelopeTargetBeyondRange _ -> "beyond range"
+    EnvelopeTargetOutsideArc _ -> "outside arc"
+
+-- | The box a primitive's drawn geometry occupies in the world.
+drawnBounds :: [Vec3] -> Bounds
+drawnBounds points =
+  Bounds
+    { boundsMinX = minimum (fmap (realToFrac . vec3X) points)
+    , boundsMaxX = maximum (fmap (realToFrac . vec3X) points)
+    , boundsMinY = minimum (fmap (realToFrac . vec3Y) points)
+    , boundsMaxY = maximum (fmap (realToFrac . vec3Y) points)
+    }
+
+-- | How far a drawn envelope may sit from the sector the extent helpers compute
+-- for it: the outline is stroked on the boundary's centre line, so its ribbon
+-- reaches half a stroke width outside, and the arc's chords cut a little inside
+-- between samples. Both together are under half a world unit at the shipped
+-- geometry, which is about one and a half canvas pixels.
+drawnEnvelopeTolerance :: Double
+drawnEnvelopeTolerance = 0.4
+
+-- | Two boxes compared edge by edge, with a tolerance: the drawn envelope is
+-- the sector plus or minus a stroke's own width, not the sector to the last
+-- decimal.
+assertBoundsApprox :: String -> Double -> Bounds -> Bounds -> IO ()
+assertBoundsApprox label tolerance expected actual = do
+  assertApproxWithin (label <> " min x") tolerance (boundsMinX expected) (boundsMinX actual)
+  assertApproxWithin (label <> " max x") tolerance (boundsMaxX expected) (boundsMaxX actual)
+  assertApproxWithin (label <> " min y") tolerance (boundsMinY expected) (boundsMinY actual)
+  assertApproxWithin (label <> " max y") tolerance (boundsMaxY expected) (boundsMaxY actual)
+
+assertApproxWithin :: String -> Double -> Double -> Double -> IO ()
+assertApproxWithin label tolerance expected actual =
+  if abs (expected - actual) <= tolerance
+    then pure ()
+    else die $ label <> ": expected " <> show expected <> " within " <> show tolerance <> ", got " <> show actual
 
 -- | A pointer in the shipped canvas's own pixels, converted the way the client
 -- converts one.
