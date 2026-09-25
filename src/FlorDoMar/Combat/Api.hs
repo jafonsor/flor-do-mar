@@ -17,6 +17,7 @@ module FlorDoMar.Combat.Api
   , findSnapshotShip
   , planNavigationForSnapshot
   , shipFromSnapshot
+  , shipSnapshotReloadProgress
   )
 where
 
@@ -209,6 +210,22 @@ findSnapshotShip identity = go . combatSnapshotShips
         | shipSnapshotId ship == identity -> Just ship
         | otherwise -> go remaining
       [] -> Nothing
+
+-- | How far a ship's shared reload has come: zero when a volley has just
+-- started it, one when the guns are loaded again.
+--
+-- It reads the snapshot's reload pair alone, not the fire permission, because
+-- the guns reload whether or not they are permitted to fire — so disengaging
+-- mid-reload leaves the reading running to full instead of resetting it. Every
+-- readout of one reload goes through this one function, so a reload circle and a
+-- firing envelope's fill cannot read the same counter differently.
+shipSnapshotReloadProgress :: ShipSnapshot -> Double
+shipSnapshotReloadProgress snapshot
+  | total <= 0 = 1
+  | otherwise = fromIntegral (max 0 (min total (total - remaining))) / fromIntegral total
+ where
+  remaining = shipSnapshotReloadTicksRemaining snapshot
+  total = shipSnapshotReloadTicksTotal snapshot
 
 shipFromSnapshot :: ShipSnapshot -> Ship
 shipFromSnapshot snapshot =

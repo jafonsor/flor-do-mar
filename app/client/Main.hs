@@ -298,7 +298,7 @@ engagementSetupFromSnapshot snapshot =
     }
  where
   shipKind identity =
-    case findShipSnapshot identity snapshot of
+    case findSnapshotShip identity snapshot of
       Just ship -> shipSnapshotBoatKind ship
       Nothing -> error "initial engagement is missing a ship"
 
@@ -323,7 +323,7 @@ gunneryPanel snapshotDynamic =
 
 shipLine :: ShipId -> CombatSnapshot -> Text
 shipLine identity snapshot =
-  case findShipSnapshot identity snapshot of
+  case findSnapshotShip identity snapshot of
     Nothing -> "No ship"
     Just ship ->
       Text.intercalate
@@ -345,7 +345,7 @@ gunneryLine snapshot =
 
 shipGunneryLine :: ShipId -> CombatSnapshot -> Text
 shipGunneryLine identity snapshot =
-  case findShipSnapshot identity snapshot of
+  case findSnapshotShip identity snapshot of
     Nothing -> "No ship"
     Just ship ->
       Text.intercalate
@@ -372,12 +372,6 @@ outcomeText outcome =
     Winner PlayerShip -> "Victory"
     Winner EnemyShip -> "Defeat"
     MutualDestruction -> "Mutual destruction"
-
-findShipSnapshot :: ShipId -> CombatSnapshot -> Maybe ShipSnapshot
-findShipSnapshot identity snapshot =
-  case filter ((== identity) . shipSnapshotId) (combatSnapshotShips snapshot) of
-    ship : _ -> Just ship
-    [] -> Nothing
 
 keepSnapshot :: CombatSnapshot -> Either CombatApiError CombatSnapshot -> CombatSnapshot
 keepSnapshot fallback result =

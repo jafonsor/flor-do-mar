@@ -96,6 +96,7 @@ main = do
   testPerSideVerdictFollowsEachShipsOwnLock
   testReloadingShipStillReportsItsTargetInside
   testSnapshotPublishesNoSideHeldForALockItCannotAnswer
+  testHandBuiltSelfLockFiresNothingAndHoldsNothing
   testSnapshotTuningMatchesTheBoatConfig
   testHotReloadedGunneryTuningReachesTheSnapshot
   testBroadsideGeometryIsTheEnvelopeCheck
@@ -571,7 +572,7 @@ testArmingOnTheTickTheReloadCompletesCatchesThatTicksVolley = do
   assertEqual "the caught volley starts the reload" reloadTicks (shipReload (combatPlayer caught))
 
 -- | Every volley in a tick is decided before any of them is applied, so two
--- ships that can each disable the other both land their shot. A phase that
+-- ships that can each disable the other both land their volley. A phase that
 -- resolved one ship at a time would leave the first shooter afloat.
 testVolleysInOneTickResolveSimultaneously :: IO ()
 testVolleysInOneTickResolveSimultaneously = do
@@ -731,7 +732,7 @@ testEnemyArmOrderIsRefusedAndReportedDuringAReload = do
 -- the shared reload blocks the next one.
 --
 -- Setting the two flags by hand is deliberate: this is the phase the enemy's
--- shots leave through, exercised without the autopilot's timing around it.
+-- volleys leave through, exercised without the autopilot's timing around it.
 testEnemyFiresThroughTheSameVolleyPhase :: IO ()
 testEnemyFiresThroughTheSameVolleyPhase = do
   let
@@ -770,7 +771,7 @@ testEnemyVolleysObeyTheSameRefusals = do
     ticked scenario = tickCombatWithTuning 1 (const legacyMovementPhysics) (const enemyTuning) [] scenario
     -- The enemy's port beam points south from its opening heading, so a player
     -- eighty units south of it is on the beam and past the guns' reach: only the
-    -- range can refuse that shot.
+    -- range can refuse that volley.
     onTheBeamBeyondReach =
       caravelaDuel
         { combatEnemy =
@@ -913,7 +914,7 @@ orbitOrderOnTheRing centre state =
 -- enemy circling a 24-unit ring only closes once the player stops running, and a
 -- player who shoots back disables an 80-hull boat before it gets a second volley
 -- away. Both of those are balance, not mechanism — this test is about the enemy
--- getting its shots off through the shared path.
+-- getting its volleys off through the shared path.
 testLocalApiEnemyClosesLocksArmsAndDamagesThePlayer :: IO ()
 testLocalApiEnemyClosesLocksArmsAndDamagesThePlayer = do
   config <- expectRight "load packaged config for the enemy's fight" =<< loadRuntimeCombatConfig
@@ -2242,6 +2243,39 @@ testSnapshotPublishesNoSideHeldForALockItCannotAnswer = do
   assertEqual "a ship's port side never holds its own hull" False (shipSnapshotPortHoldsTarget selfPlayer)
   assertEqual "a ship's starboard side never holds its own hull" False (shipSnapshotStarboardHoldsTarget selfPlayer)
 
+-- | A lock state built by hand cannot make the volley phase and the read model
+-- disagree. This state grants permission and turns the player's starboard beam
+-- onto its own bearing, where a phase that read the lock raw would fire a volley
+-- at the player's own hull while the same state's snapshot published \"no side
+-- holds the target\". The phase resolves the lock through 'lockedTargetShip', so
+-- it fires nothing, and the two readings are one rule.
+testHandBuiltSelfLockFiresNothingAndHoldsNothing :: IO ()
+testHandBuiltSelfLockFiresNothingAndHoldsNothing = do
+  let
+    selfLocked =
+      caravelaDuel
+        { combatPlayer =
+            (combatPlayer caravelaDuel)
+              { shipHeading = Heading 90
+              , shipTargetHeading = Heading 90
+              , shipLockedTarget = Just PlayerShip
+              , shipFirePermission = True
+              }
+        }
+    ticked = tickCombat [] selfLocked
+    snapshot = combatSnapshotFromState caravelaDuelScenario selfLocked
+  assertEqual "a hand-built self-lock fires no volley at its own hull" 100 (shipHull (combatPlayer ticked))
+  assertEqual "a hand-built self-lock starts no reload" 0 (shipReload (combatPlayer ticked))
+  player <- expectShipSnapshot "the self-locked player's snapshot" PlayerShip snapshot
+  assertEqual
+    "and the same state's snapshot reports no port side holding the target"
+    False
+    (shipSnapshotPortHoldsTarget player)
+  assertEqual
+    "and no starboard side holding it either"
+    False
+    (shipSnapshotStarboardHoldsTarget player)
+
 -- | The published tuning is the boat config the ship is flying, not the legacy
 -- fixture: the tuned boats reach, bear and reload by different numbers, and each
 -- ship's snapshot reports its own boat's.
@@ -2705,7 +2739,7 @@ testBattleInputMouseNavigationGesture = do
         battleCamera
         (RawPrimaryPointerDown centerPointer canvasSize)
     reachableWaypoint = navigationPlanReachableWaypoint tightPlan
-    gesture = beginNavigationGesture reachableWaypoint 6
+    gesture = beginNavigationGestureAt reachableWaypoint reachableWaypoint 6 Nothing
     eastDrag = updateNavigationGesture (offsetPoint reachableWaypoint 4 0) gesture
     northDrag = updateNavigationGesture (offsetPoint reachableWaypoint 0 4) gesture
     stoppedDrag = updateNavigationGesture reachableWaypoint gesture
@@ -3111,26 +3145,30 @@ testFiringEnvelopeMatchesTheEnforcedEnvelope = do
 
 -- | The wedge's fill is the shared reload's progress, drawn identically on both
 -- of a ship's wedges, and the outline is the whole envelope whatever the fill
--- has reached. The fill reads the same function over the same pair of counters
--- the reload circle reads, so the two readouts of one reload cannot disagree.
+-- has reached. The fill reads the read model's own function over the snapshot's
+-- pair of counters, which is the same function the reload circle reads, so the
+-- two readouts of one reload cannot disagree.
 testFiringEnvelopeFillTracksTheSharedReload :: IO ()
 testFiringEnvelopeFillTracksTheSharedReload = do
   let
     range = broadsideTuningRange legacyBroadsideTuning
     total = broadsideTuningReloadTicks legacyBroadsideTuning
-    sceneAt remaining =
-      battleRenderSceneFromSnapshot $
-        panelSnapshotWith (withPlayerShip (\ship -> ship {shipLockedTarget = Just EnemyShip, shipReload = remaining}))
+    snapshotAt remaining =
+      panelSnapshotWith (withPlayerShip (\ship -> ship {shipLockedTarget = Just EnemyShip, shipReload = remaining}))
     centre = shipPosition (combatPlayer caravelaDuel)
   forM_ [0 .. total] $ \remaining -> do
     let
       label = "reload " <> show remaining <> " of " <> show total
-      expected = range * reloadProgress remaining total
-    portWedge <- expectFiringEnvelope label "firing-envelope:port:player" (sceneAt remaining)
-    starboardWedge <- expectFiringEnvelope label "firing-envelope:starboard:player" (sceneAt remaining)
+      snapshot = snapshotAt remaining
+      scene = battleRenderSceneFromSnapshot snapshot
+    reloadingPlayer <-
+      expectShipSnapshot (label <> ": the snapshot carries the player's reload") PlayerShip snapshot
+    let expected = range * shipSnapshotReloadProgress reloadingPlayer
+    portWedge <- expectFiringEnvelope label "firing-envelope:port:player" scene
+    starboardWedge <- expectFiringEnvelope label "firing-envelope:starboard:player" scene
     portShape <- firingEnvelopeShapeOf label portWedge
     starboardShape <- firingEnvelopeShapeOf label starboardWedge
-    vertices <- primitiveWorldVertices "firing-envelope:port:player" (sceneAt remaining)
+    vertices <- primitiveWorldVertices "firing-envelope:port:player" scene
     let drawnRadii = fmap (fst . worldOffset centre) vertices
     assertApproxWithin
       (label <> ": the port wedge fills to the reload's progress")
@@ -3173,21 +3211,28 @@ testFiringEnvelopeFillAndHighlightAreIndependent = do
       withEnemyShip (\ship -> ship {shipPosition = enemyPosition}) $
         withPlayerShip (\ship -> ship {shipReload = remaining}) playerReadyToFire
     portWedgeOf label state = do
-      let scene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario state)
+      let
+        snapshot = combatSnapshotFromState caravelaDuelScenario state
+        scene = battleRenderSceneFromSnapshot snapshot
+      player <- expectShipSnapshot (label <> ": the snapshot carries the player") PlayerShip snapshot
       wedge <- expectFiringEnvelope label "firing-envelope:port:player" scene
       shape <- firingEnvelopeShapeOf label wedge
-      pure (realToFrac (sectorWedgeFilledRadius shape), materialColor (renderMeshMaterial wedge))
-  (loadedUnlitFill, loadedUnlitColor) <- portWedgeOf "loaded, target turned away" (duelWith 0 enemyAstern)
-  (loadedLitFill, loadedLitColor) <- portWedgeOf "loaded, target inside" (duelWith 0 enemyAhead)
-  (partialUnlitFill, partialUnlitColor) <- portWedgeOf "reloading, target turned away" (duelWith partial enemyAstern)
-  (partialLitFill, partialLitColor) <- portWedgeOf "reloading, target inside" (duelWith partial enemyAhead)
+      pure
+        ( realToFrac (sectorWedgeFilledRadius shape)
+        , materialColor (renderMeshMaterial wedge)
+        , range * shipSnapshotReloadProgress player
+        )
+  (loadedUnlitFill, loadedUnlitColor, _) <- portWedgeOf "loaded, target turned away" (duelWith 0 enemyAstern)
+  (loadedLitFill, loadedLitColor, _) <- portWedgeOf "loaded, target inside" (duelWith 0 enemyAhead)
+  (partialUnlitFill, partialUnlitColor, _) <- portWedgeOf "reloading, target turned away" (duelWith partial enemyAstern)
+  (partialLitFill, partialLitColor, partialLitExpected) <- portWedgeOf "reloading, target inside" (duelWith partial enemyAhead)
   assertApproxWithin "a loaded wedge is full" drawnEnvelopeTolerance range loadedUnlitFill
   assertEqual "a full wedge is unhighlighted while the target is turned away" playerBlueColor loadedUnlitColor
   assertEqual "and highlighted while the target is inside it" highlightColor loadedLitColor
   assertApproxWithin
     "a reloading wedge is filled only to the reload's progress"
     drawnEnvelopeTolerance
-    (range * reloadProgress partial total)
+    partialLitExpected
     partialLitFill
   assertEqual "a part-filled wedge can be highlighted" highlightColor partialLitColor
   assertEqual "and an equally part-filled wedge is unhighlighted when turned away" playerBlueColor partialUnlitColor
@@ -3266,10 +3311,12 @@ testFiringEnvelopeDesaturatesWhenTheGunsAreNotPermitted = do
     disengagedOutOfReach =
       withEnemyShip (\ship -> ship {shipPosition = Point 0 500, shipLockedTarget = Just PlayerShip, shipFirePermission = False}) $
         withPlayerShip (\ship -> ship {shipFirePermission = False}) (playerLockedOnTheEnemy caravelaDuel)
-    armedScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario armedState)
+    armedSnapshot = combatSnapshotFromState caravelaDuelScenario armedState
+    armedScene = battleRenderSceneFromSnapshot armedSnapshot
     disengagedScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario disengagedState)
     quietScene = battleRenderSceneFromSnapshot (combatSnapshotFromState caravelaDuelScenario disengagedOutOfReach)
-    partway = range * reloadProgress (total - 1) total
+  armedPlayer <- expectShipSnapshot "the armed snapshot carries the player's reload" PlayerShip armedSnapshot
+  let partway = range * shipSnapshotReloadProgress armedPlayer
   armedPort <- firingEnvelopeColorOf "armed port" "firing-envelope:port:player" armedScene
   armedStarboard <- firingEnvelopeColorOf "armed starboard" "firing-envelope:starboard:player" armedScene
   disengagedPort <- firingEnvelopeColorOf "disengaged port" "firing-envelope:port:player" disengagedScene
@@ -3336,11 +3383,11 @@ testFiringEnvelopeSitsAboveTheHull = do
     True
     (all ((== 0) . vec3Z) (geometry3DVertices (renderPrimitiveGeometry primitive)))
 
--- | The two states a lock alone does not earn a wedge in: an engagement that
--- has finished, whose volley phase no longer runs, and a hull that has been
--- destroyed. A lit wedge there would promise a volley nothing will send, so
--- neither is drawn — and the other ship's envelopes go on being drawn, because
--- the rule is the ship's own state rather than the scene's.
+-- | The two states a lock alone does not earn a wedge in. A finished engagement
+-- is the scene's own rule: its status removes every ship's wedges, because the
+-- volley phase no longer runs and a lit wedge would promise a volley nothing
+-- will send. A destroyed hull is the ship's own rule: only that ship's wedges
+-- go, and the ship still afloat keeps its own.
 testFiringEnvelopeIsHiddenForFinishedAndDisabledShips :: IO ()
 testFiringEnvelopeIsHiddenForFinishedAndDisabledShips = do
   let
@@ -3588,7 +3635,7 @@ firingEnvelopeColorOf label name scene =
 firingEnvelopeShapeOf :: String -> RenderMesh -> IO SectorWedge
 firingEnvelopeShapeOf label mesh =
   case renderMeshGeometry mesh of
-    FiringEnvelopeGeometry wedge -> pure wedge
+    SectorGeometry wedge -> pure wedge
     UnitCubeGeometry -> die $ label <> ": expected a firing envelope, got a unit cube"
 
 -- | One named primitive's drawn geometry in world units, with the node's own

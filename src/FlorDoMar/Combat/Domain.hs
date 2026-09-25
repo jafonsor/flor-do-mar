@@ -515,11 +515,11 @@ coolDownReloads =
 
 -- | Fire one volley per ship whose loaded guns can reach its locked target.
 --
--- This is the phase that turns the fire-control state into damage. Every shot is
--- decided against the state the phase started with and only then applied, so two
--- ships that can both reach each other trade volleys in the same tick: neither
--- can disable the other out of its own shot. The enemy fires through this phase
--- exactly as the player does.
+-- This is the phase that turns the fire-control state into damage. Every volley
+-- is decided against the state the phase started with and only then applied, so
+-- two ships that can both reach each other trade volleys in the same tick:
+-- neither can disable the other out of its own volley. The enemy fires through
+-- this phase exactly as the player does.
 --
 -- The whole envelope test is 'canFireBroadsideWith' — the same predicate the
 -- snapshot publishes per side — so the area a client draws and the area the guns
@@ -542,8 +542,12 @@ fireVolleys broadsideTuningForShip state =
 volleyFor :: (Ship -> BroadsideTuning) -> CombatState -> Ship -> Maybe (ShipId, ShipId, BroadsideTuning)
 volleyFor broadsideTuningForShip state attacker = do
   guard (shipFirePermission attacker)
-  targetId <- shipLockedTarget attacker
-  guard (scenarioContainsShip targetId state)
+  -- The lock is resolved by the read model's own lookup rather than read raw, so
+  -- the phase fires only at a ship the scenario carries and that is not the
+  -- attacker: a state built by hand with a self-lock fires nothing, exactly as
+  -- its snapshot reports neither side holding the target.
+  target <- lockedTargetShip state attacker
+  let targetId = shipId target
   -- Whichever side holds the target is the side that fires, and the other cannot.
   -- The two firing arcs are disjoint for any half-angle the shipped configs can
   -- use, so there is exactly one candidate; 'find' keeps the choice deterministic

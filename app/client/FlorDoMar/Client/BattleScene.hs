@@ -22,7 +22,6 @@ import Control.Monad (guard)
 import Data.List (find)
 import Data.Text (Text)
 import FlorDoMar.Client.BattleInput
-import FlorDoMar.Client.GunPanel (reloadProgress)
 import FlorDoMar.Client.Render.Scene
 import FlorDoMar.Client.WebGL.Camera
 import FlorDoMar.Client.WebGL.Geometry
@@ -84,6 +83,9 @@ data ShipMarker = ShipMarker
   , markerFirePermission :: Bool
   , markerReloadTicksRemaining :: Int
   , markerReloadTicksTotal :: Int
+  , markerReloadProgress :: Double
+  -- ^ How far the shared reload has come, read off the snapshot's own pair by
+  -- 'shipSnapshotReloadProgress' rather than restated here.
   , markerPortHoldsTarget :: Bool
   , markerStarboardHoldsTarget :: Bool
   }
@@ -188,6 +190,7 @@ shipMarker ship =
     , markerFirePermission = shipSnapshotFirePermission ship
     , markerReloadTicksRemaining = shipSnapshotReloadTicksRemaining ship
     , markerReloadTicksTotal = shipSnapshotReloadTicksTotal ship
+    , markerReloadProgress = shipSnapshotReloadProgress ship
     , markerPortHoldsTarget = shipSnapshotPortHoldsTarget ship
     , markerStarboardHoldsTarget = shipSnapshotStarboardHoldsTarget ship
     }
@@ -460,7 +463,7 @@ firingEnvelopeMesh :: ShipMarker -> BroadsideSide -> RenderMesh
 firingEnvelopeMesh marker side =
   RenderMesh
     { renderMeshName = firingEnvelopeNodeName side marker
-    , renderMeshGeometry = FiringEnvelopeGeometry (firingEnvelopeWedge marker side)
+    , renderMeshGeometry = SectorGeometry (firingEnvelopeWedge marker side)
     , renderMeshMaterial = basicMaterial (firingEnvelopeColor marker side)
     , renderMeshTransform = firingEnvelopeTransform marker
     }
@@ -469,12 +472,13 @@ firingEnvelopeMesh marker side =
 -- describes, in the hull's frame, with the radius the shared reload has filled
 -- it to.
 --
--- The range and the arc come off the marker, which carries them off the
--- snapshot, so the drawn envelope is the one the simulation enforces. The angles
--- are local to the hull — the node's transform applies the heading — and they
--- are the domain's convention: the port beam is 90 degrees counter-clockwise of
--- the heading and the starboard beam 90 the other way, each spanning the
--- half-angle either side of it, exactly as 'broadsideHeading' measures it.
+-- The range, the arc and the fill all come off the marker, which carries them
+-- off the snapshot, so the drawn envelope is the one the simulation enforces and
+-- the fill is the read model's own fraction of the reload. The angles are local
+-- to the hull — the node's transform applies the heading — and they are the
+-- domain's convention: the port beam is 90 degrees counter-clockwise of the
+-- heading and the starboard beam 90 the other way, each spanning the half-angle
+-- either side of it, exactly as 'broadsideHeading' measures it.
 firingEnvelopeWedge :: ShipMarker -> BroadsideSide -> SectorWedge
 firingEnvelopeWedge marker side =
   SectorWedge
@@ -485,7 +489,7 @@ firingEnvelopeWedge marker side =
           , sectorEndAngle = beam + halfAngle
           , sectorSegments = firingEnvelopeSegments halfAngle
           }
-    , sectorWedgeFilledRadius = range * realToFrac (reloadProgress remaining total)
+    , sectorWedgeFilledRadius = range * realToFrac (markerReloadProgress marker)
     , sectorWedgeOutlineWidth = firingEnvelopeOutlineWidth
     }
  where
@@ -493,8 +497,6 @@ firingEnvelopeWedge marker side =
   range = realToFrac (broadsideTuningRange tuning)
   halfAngle = realToFrac (broadsideTuningFiringArcDegrees tuning) * pi / 180
   beam = broadsideBeamAngle side
-  remaining = markerReloadTicksRemaining marker
-  total = markerReloadTicksTotal marker
 
 -- | The beam a broadside fires along, in the hull's own frame, whose positive x
 -- axis the transform turns onto the heading.

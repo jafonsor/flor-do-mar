@@ -12,9 +12,6 @@ module FlorDoMar.Client.WebGL.Geometry
   , rect
   , rectangleGeometry
   , ringStrokeGeometry
-  , sectorArcPoints
-  , sectorFillGeometry
-  , sectorOutlinePoints
   , sectorWedgeGeometry
   , strokePathGeometry
   , unitCubeGeometry

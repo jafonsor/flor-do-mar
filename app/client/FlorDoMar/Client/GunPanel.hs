@@ -13,7 +13,6 @@ module FlorDoMar.Client.GunPanel
   , GunPanelState (..)
   , applyFireAtWillRequestUpdate
   , gunPanelState
-  , reloadProgress
   , settleFireAtWillRequest
   )
 where
@@ -94,7 +93,7 @@ gunPanelState snapshot request hoveredShip =
     { gunPanelTick = combatSnapshotTick snapshot
     , gunPanelArmed = displayedArmed
     , gunPanelToggleEnabled = displayedArmed || reloadRemaining == 0
-    , gunPanelReloadProgress = reloadProgress reloadRemaining reloadTotal
+    , gunPanelReloadProgress = maybe 1 shipSnapshotReloadProgress player
     , gunPanelReloadTicksRemaining = reloadRemaining
     , gunPanelReloadTicksTotal = reloadTotal
     , gunPanelReloadSweepSeconds = reloadSweepSeconds
@@ -118,14 +117,3 @@ gunPanelState snapshot request hoveredShip =
         case lockedTarget of
           Just locked | locked /= PlayerShip -> Just locked
           _ -> Nothing
-
--- | How far the shared reload has come: zero when a volley has just started it,
--- one when the guns are loaded again.
---
--- It reads the reload counter alone, not the fire permission, because the guns
--- reload whether or not they are permitted to fire — so disengaging mid-reload
--- leaves the sweep running to full instead of resetting it.
-reloadProgress :: Int -> Int -> Double
-reloadProgress remaining total
-  | total <= 0 = 1
-  | otherwise = fromIntegral (max 0 (min total (total - remaining))) / fromIntegral total

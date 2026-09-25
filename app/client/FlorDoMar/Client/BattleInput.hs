@@ -12,7 +12,6 @@ module FlorDoMar.Client.BattleInput
   , ScreenPoint (..)
   , ScreenSize (..)
   , applyNavigationHoverIntent
-  , beginNavigationGesture
   , beginNavigationGestureAt
   , hoverIntentFromRawPointer
   , hoveredShipAt
@@ -170,10 +169,6 @@ beginNavigationGestureAt requestedWaypoint reachableWaypoint maximumSpeed presse
       , navigationPressShip = pressedShip
       }
     Nothing
-
-beginNavigationGesture :: Point -> Double -> NavigationGesture
-beginNavigationGesture waypoint maximumSpeed =
-  beginNavigationGestureAt waypoint waypoint maximumSpeed Nothing
 
 updateNavigationGesture :: Point -> NavigationGesture -> NavigationGesture
 updateNavigationGesture pointer gesture =
