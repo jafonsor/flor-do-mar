@@ -30,10 +30,13 @@ module FlorDoMar.Combat.Domain
   , canLockTarget
   , canSetFireAtWill
   , caravelaDuel
+  , enemyGunneryOrders
+  , enemyLockDelayTicks
+  , enemyOrbitRadius
+  , issueEnemyGunneryOrders
+  , issueNavigationOrder
   , legacyBroadsideTuning
   , legacyMovementPhysics
-  , enemyOrbitRadius
-  , issueNavigationOrder
   , lockedTargetShip
   , moveShip
   , navigationArrivalRadius
@@ -297,12 +300,20 @@ tickCombatWithTuning tickSeconds movementForShip broadsideTuningForShip commands
             (applyCommand tickSeconds movementForShip)
             (coolDownReloads state {combatTick = combatTick state + 1})
             commands
+        -- The enemy's own orders are ordinary commands applied through the same
+        -- 'applyCommand' the player's commands take, and they are applied here,
+        -- after the player's queued commands and before the volley phase, so the
+        -- tick that arms the enemy is a tick it can fire on — the same rule the
+        -- player gets. They cannot be dropped into the player's queue: a rejected
+        -- order leaves the state alone, so an arm refused during a reload is
+        -- simply re-issued on the next tick and accepted when the reload finishes.
+        withEnemyOrders = issueEnemyGunneryOrders tickSeconds movementForShip commanded
         -- The volley phase sits between the tick's commands and its movement. A
         -- volley is therefore judged against the geometry the client last drew —
         -- the post-command, pre-movement state — rather than against positions
         -- the player has not seen yet, and its damage belongs to this tick, so
         -- 'finishIfTerminal' runs straight after it.
-        resolved = finishIfTerminal (fireVolleys broadsideTuningForShip commanded)
+        resolved = finishIfTerminal (fireVolleys broadsideTuningForShip withEnemyOrders)
        in
         case combatStatus resolved of
           ScenarioFinished _ -> resolved
@@ -630,6 +641,61 @@ enemyOrbitWaypoint autopilot =
  where
   center = enemyOrbitCenter autopilot
   radians = 2 * pi * fromIntegral (enemyOrbitNextWaypointIndex autopilot `mod` enemyOrbitWaypointCount) / fromIntegral enemyOrbitWaypointCount
+
+-- | How long the enemy waits from scenario start before acquiring its lock.
+--
+-- The enemy must not acquire on tick 0: 'combatTick' is incremented at the top
+-- of the tick before any command is applied, so this is compared against the
+-- counter's post-increment value and the lock lands on the tick whose number
+-- reaches it. Both sides start disengaged, and locking is the only opening
+-- asymmetry, so this delay is that asymmetry and nothing else.
+--
+-- Three ticks is a starting value chosen for feel, not a tuned one. It has not
+-- been play-tested: issue 07's on-screen check is where it gets tuned by
+-- watching the fight. It is deliberately not zero, so the opening is not a
+-- simultaneous exchange.
+enemyLockDelayTicks :: Int
+enemyLockDelayTicks = 3
+
+-- | The enemy's gunnery orders for this tick, in the order they must be applied.
+--
+-- Both are the player's own commands, and the tick submits them through
+-- 'applyCommand', so the enemy cannot lock itself, cannot lock a ship the
+-- scenario does not carry, cannot be armed during a reload, and cannot fire
+-- without a lock — all for the same reasons the player cannot, because it is
+-- running the same code. Nothing here writes 'shipLockedTarget' or
+-- 'shipFirePermission': those two are reachable only through their commands.
+--
+-- The enemy locks once, and holding a lock is what stops it locking again — the
+-- 'Lock' command toggles, so an order re-issued against a target already held
+-- would release it. Arming is re-issued every tick it holds a lock without
+-- permission, so an order refused during a reload is retried rather than
+-- dropped. It never withdraws permission, and it has no order that could.
+enemyGunneryOrders :: CombatState -> [CombatCommand]
+enemyGunneryOrders state
+  | shipHull enemy <= 0 = []
+  -- A finished scenario accepts no orders from anyone, this autopilot included.
+  | ScenarioFinished _ <- combatStatus state = []
+  -- Before the lock delay: no orders at all.
+  | not (enemyLockDelayElapsed state) = []
+  | Nothing <- lockedTargetShip state enemy = [Lock EnemyShip PlayerShip]
+  | shipFirePermission enemy = []
+  | otherwise = [SetFireAtWill EnemyShip True]
+ where
+  enemy = combatEnemy state
+
+-- | Whether the lock delay has elapsed by the tick the state stands on.
+--
+-- 'combatTick' has already been incremented for this tick when the enemy's
+-- orders are chosen, so a delay of @n@ leaves the enemy unlocked on ticks 1
+-- through @n - 1@ and locking on tick @n@.
+enemyLockDelayElapsed :: CombatState -> Bool
+enemyLockDelayElapsed state = combatTick state >= enemyLockDelayTicks
+
+-- | Apply the enemy's gunnery orders through the ordinary command path.
+issueEnemyGunneryOrders :: Double -> (Ship -> MovementPhysics) -> CombatState -> CombatState
+issueEnemyGunneryOrders tickSeconds movementForShip state =
+  foldl (applyCommand tickSeconds movementForShip) state (enemyGunneryOrders state)
 
 legacyBroadsideTuning :: BroadsideTuning
 legacyBroadsideTuning =

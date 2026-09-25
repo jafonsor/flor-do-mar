@@ -43,6 +43,14 @@ main = do
   testArmingOnTheTickTheReloadCompletesCatchesThatTicksVolley
   testVolleysInOneTickResolveSimultaneously
   testVolleysJudgeTheGeometryTheClientLastDrew
+  testEnemyLockAndArmGoThroughTheSameCommands
+  testEnemyLockDelayIsANamedNonZeroConstant
+  testEnemyArmOrderIsRefusedAndReportedDuringAReload
+  testEnemyFiresThroughTheSameVolleyPhase
+  testEnemyVolleysObeyTheSameRefusals
+  testDisabledEnemyAcquiresNothing
+  testEnemyNeverWithdrawsPermission
+  testEnemyOrbitKeepsAdvancingWhileEngaged
   testADisabledShipFiresNothing
   testTerminalHullState
   testLoadsRuntimeCombatConfig
@@ -95,6 +103,7 @@ main = do
   testLocalApiExposesLockedTargetAndFirePermission
   testLocalApiFiresAndWithdrawsThroughTheQueuedOrders
   testLocalApiReportsTerminalState
+  testLocalApiEnemyClosesLocksArmsAndDamagesThePlayer
   testInitialBattleRenderScene
   testShippedEngagementFitsTheVisibleExtent
   testShippedEnemyOrbitRingStaysInsideTheVisibleExtent
@@ -617,6 +626,325 @@ playerHoldingFire =
   playerReadyToFire
     { combatPlayer = (combatPlayer playerReadyToFire) {shipFirePermission = False}
     }
+
+-- | The enemy fights through the commands a player uses: it locks the player
+-- with 'Lock' and arms itself with 'SetFireAtWill', both submitted through the
+-- tick's ordinary command path, and never by writing 'shipLockedTarget' or
+-- 'shipFirePermission' directly.
+--
+-- Locking needs no permission and grants none, exactly as it does for the player:
+-- the enemy is committed to a target on the tick it locks and still silent until
+-- its next order is applied.
+testEnemyLockAndArmGoThroughTheSameCommands :: IO ()
+testEnemyLockAndArmGoThroughTheSameCommands = do
+  let
+    afterDelay = advanceTicks (enemyLockDelayTicks - 1) caravelaDuel
+    locked = advanceTicks enemyLockDelayTicks caravelaDuel
+    armed = advanceTicks (enemyLockDelayTicks + 1) caravelaDuel
+  assertEqual "the enemy locks the player through the ordinary lock command" (Just PlayerShip) (shipLockedTarget (combatEnemy locked))
+  assertEqual "the lock is one the domain would accept from a player" BroadsideReady (canLockTarget afterDelay EnemyShip PlayerShip)
+  assertEqual "the enemy's lock grants it no permission" False (shipFirePermission (combatEnemy locked))
+  assertEqual "the enemy's lock is not the player's" Nothing (shipLockedTarget (combatPlayer locked))
+  assertEqual "the enemy arms itself through the ordinary permission command" True (shipFirePermission (combatEnemy armed))
+  assertEqual "the enemy's arm order does not touch the player's guns" False (shipFirePermission (combatPlayer armed))
+  assertEqual "the enemy keeps the lock it armed against" (Just PlayerShip) (shipLockedTarget (combatEnemy armed))
+
+-- | The delay before the enemy's first lock is a named constant in one place, and
+-- it is not zero. The boundary is exact: the enemy is still unlocked on every
+-- tick before the delay and locked on the tick that reaches it.
+testEnemyLockDelayIsANamedNonZeroConstant :: IO ()
+testEnemyLockDelayIsANamedNonZeroConstant = do
+  assertEqual "the lock delay is a named constant" 3 enemyLockDelayTicks
+  assertEqual "the lock delay is not zero" True (enemyLockDelayTicks > 0)
+  assertEqual
+    "the enemy holds no lock on the tick before the delay"
+    Nothing
+    (shipLockedTarget (combatEnemy (advanceTicks (enemyLockDelayTicks - 1) caravelaDuel)))
+  assertEqual
+    "the enemy acquires its lock on the delay tick"
+    (Just PlayerShip)
+    (shipLockedTarget (combatEnemy (advanceTicks enemyLockDelayTicks caravelaDuel)))
+  assertEqual
+    "the delay is counted in ticks from scenario start"
+    enemyLockDelayTicks
+    (combatTick (advanceTicks enemyLockDelayTicks caravelaDuel))
+
+-- | The enemy is subject to the same arm guard the player is: while its shared
+-- reload is above zero the autopilot's arm order is refused, the refusal is the
+-- named 'BroadsideReloading' the player would get, and the guns stay disengaged.
+--
+-- A refused order leaves the state alone rather than being dropped, so the same
+-- order is re-issued on the following tick and accepted once the reload finishes.
+-- The player is far outside the enemy's reach here, so the silence being asserted
+-- is the guard's doing rather than the geometry's.
+testEnemyArmOrderIsRefusedAndReportedDuringAReload :: IO ()
+testEnemyArmOrderIsRefusedAndReportedDuringAReload = do
+  let
+    -- A volley is what starts this reload; the fixture sets it and clears the
+    -- permission it would have left behind, which is the one state in which the
+    -- autopilot has an arm order to place during a reload.
+    reloading =
+      caravelaDuel
+        { combatEnemy =
+            (combatEnemy caravelaDuel)
+              { shipLockedTarget = Just PlayerShip
+              , shipFirePermission = False
+              , shipReload = reloadTicks
+              }
+        }
+    refused = tickCombat [] reloading
+    cooledOnce = tickCombat [] refused
+    loaded = tickCombat [] cooledOnce
+  assertEqual "the order the autopilot places is refused by the reload guard" (BroadsideReloading reloadTicks) (canSetFireAtWill reloading EnemyShip True)
+  assertEqual "the guard reads the counter's pre-tick value, as it does for the player" (BroadsideReloading 1) (canSetFireAtWill cooledOnce EnemyShip True)
+  assertEqual "the tick's decrement still applies to the refused arm order" 2 (shipReload (combatEnemy refused))
+  assertEqual "the refused arm order does not permit the enemy's guns" False (shipFirePermission (combatEnemy refused))
+  assertEqual "the reloading enemy fires nothing" 100 (shipHull (combatPlayer refused))
+  assertEqual "the enemy re-issues the refused order rather than dropping it" True (shipFirePermission (combatEnemy loaded))
+  assertEqual "the re-issued order is accepted once the reload reaches zero" 0 (shipReload (combatEnemy loaded))
+
+-- | The enemy's volleys leave through the tick's own volley phase and the one
+-- envelope check, so the same rules bound them as bound the player's: with the
+-- guns loaded and the player inside a broadside's envelope a volley lands, and
+-- the shared reload blocks the next one.
+--
+-- Setting the two flags by hand is deliberate: this is the phase the enemy's
+-- shots leave through, exercised without the autopilot's timing around it.
+testEnemyFiresThroughTheSameVolleyPhase :: IO ()
+testEnemyFiresThroughTheSameVolleyPhase = do
+  let
+    inEnemyEnvelope =
+      caravelaDuel
+        { combatEnemy =
+            (combatEnemy caravelaDuel)
+              { shipPosition = Point 0 40
+              , shipLockedTarget = Just PlayerShip
+              , shipFirePermission = True
+              }
+        }
+    fired = tickCombat [] inEnemyEnvelope
+    cooling = tickCombat [] fired
+  assertEqual "the enemy's port envelope holds the player" BroadsideReady (canFireBroadside inEnemyEnvelope EnemyShip PlayerShip Port)
+  assertEqual "the other beam holds nothing" (TargetOutsideFiringArc 180) (canFireBroadside inEnemyEnvelope EnemyShip PlayerShip Starboard)
+  assertEqual "the enemy's volley damages the player" 75 (shipHull (combatPlayer fired))
+  assertEqual "the volley starts the enemy's configured reload" reloadTicks (shipReload (combatEnemy fired))
+  assertEqual "the enemy takes nothing from its own volley" 100 (shipHull (combatEnemy fired))
+  assertEqual "the enemy fires nothing while its shared reload runs" 75 (shipHull (combatPlayer cooling))
+  assertEqual "the enemy's shared reload keeps counting down" 2 (shipReload (combatEnemy cooling))
+  assertEqual "the enemy holds the lock through the reload" (Just PlayerShip) (shipLockedTarget (combatEnemy cooling))
+
+-- | The enemy's volleys obey the same refusals: no lock, no permission, no target
+-- inside the envelope and no loaded guns each keep its guns silent.
+--
+-- The engine rules are read on the tick the duel starts, before the autopilot has
+-- locked anything, so the only ship that could fire is the one the fixture armed.
+-- The reach is a fixture value rather than the shipped 48: these fixtures move the
+-- duel's own geometry around, and a target that is out of reach only because the
+-- duel opens wide would not be showing the rule.
+testEnemyVolleysObeyTheSameRefusals :: IO ()
+testEnemyVolleysObeyTheSameRefusals = do
+  let
+    enemyTuning = legacyBroadsideTuning {broadsideTuningRange = 50}
+    ticked scenario = tickCombatWithTuning 1 (const legacyMovementPhysics) (const enemyTuning) [] scenario
+    -- The enemy's port beam points south from its opening heading, so a player
+    -- eighty units south of it is on the beam and past the guns' reach: only the
+    -- range can refuse that shot.
+    onTheBeamBeyondReach =
+      caravelaDuel
+        { combatEnemy =
+            (combatEnemy caravelaDuel)
+              { shipLockedTarget = Just PlayerShip
+              , shipFirePermission = True
+              }
+        }
+    facingTheLockedPlayer =
+      caravelaDuel
+        { combatEnemy =
+            (combatEnemy caravelaDuel)
+              { shipPosition = Point 0 40
+              , shipLockedTarget = Just PlayerShip
+              , shipFirePermission = True
+              }
+        }
+    outsideTheEnvelope =
+      facingTheLockedPlayer
+        { combatEnemy = (combatEnemy facingTheLockedPlayer) {shipHeading = Heading 90}
+        }
+    lockedButNotPermitted =
+      facingTheLockedPlayer
+        { combatEnemy = (combatEnemy facingTheLockedPlayer) {shipFirePermission = False}
+        }
+    reloading =
+      facingTheLockedPlayer
+        { combatEnemy = (combatEnemy facingTheLockedPlayer) {shipReload = 2}
+        }
+  assertEqual "the enemy's port beam holds the player it faces" BroadsideReady (canFireBroadsideWith (const enemyTuning) facingTheLockedPlayer EnemyShip PlayerShip Port)
+  assertEqual "the other beam holds nothing" (TargetOutsideFiringArc 180) (canFireBroadsideWith (const enemyTuning) facingTheLockedPlayer EnemyShip PlayerShip Starboard)
+  assertEqual "the player's geometry is on the port beam and only past the reach" (TargetOutOfRange 80) (canFireBroadsideWith (const enemyTuning) onTheBeamBeyondReach EnemyShip PlayerShip Port)
+  assertEqual "the enemy's early ticks put no volley on the player" 100 (shipHull (combatPlayer (advanceTicks (enemyLockDelayTicks - 1) caravelaDuel)))
+  assertEqual "the enemy's guns are still silent on the tick it locks" 100 (shipHull (combatPlayer (advanceTicks enemyLockDelayTicks caravelaDuel)))
+  assertEqual "a locked enemy with no permission fires nothing on its tick" 100 (shipHull (combatPlayer (ticked lockedButNotPermitted)))
+  assertEqual "a locked enemy with no permission stays loaded" 0 (shipReload (combatEnemy (ticked lockedButNotPermitted)))
+  assertEqual "the lock survives the tick it did not fire on" (Just PlayerShip) (shipLockedTarget (combatEnemy (ticked lockedButNotPermitted)))
+  assertEqual "a target outside both envelopes takes no volley" 100 (shipHull (combatPlayer (ticked outsideTheEnvelope)))
+  assertEqual "a target across the beams starts no reload" 0 (shipReload (combatEnemy (ticked outsideTheEnvelope)))
+  assertEqual "a target past the guns' reach takes no volley" 100 (shipHull (combatPlayer (ticked onTheBeamBeyondReach)))
+  assertEqual "a target past the guns' reach starts no reload" 0 (shipReload (combatEnemy (ticked onTheBeamBeyondReach)))
+  assertEqual "a reloading enemy fires nothing" 100 (shipHull (combatPlayer (ticked reloading)))
+  assertEqual "a reloading enemy's counter still counts down" 1 (shipReload (combatEnemy (ticked reloading)))
+
+-- | A disabled enemy acquires nothing: the autopilot places no lock and no arm
+-- order, so a wreck neither picks a target nor asks for its guns back. The two
+-- commands it would place are also refused outright by the scenario's status,
+-- which is the engine's half of the same rule.
+testDisabledEnemyAcquiresNothing :: IO ()
+testDisabledEnemyAcquiresNothing = do
+  let
+    disabled = caravelaDuel {combatEnemy = (combatEnemy caravelaDuel) {shipHull = 0}}
+    ticked = tickCombat [] disabled
+    armedWreck =
+      disabled {combatEnemy = (combatEnemy disabled) {shipFirePermission = True, shipLockedTarget = Just PlayerShip}}
+    finishedWreck = tickCombat [] armedWreck
+  assertEqual "a disabled enemy acquires no lock" Nothing (shipLockedTarget (combatEnemy ticked))
+  assertEqual "a disabled enemy is never permitted to fire" False (shipFirePermission (combatEnemy ticked))
+  assertEqual "a disabled enemy fires nothing" 100 (shipHull (combatPlayer ticked))
+  assertEqual "the scenario ends when the enemy is disabled" (ScenarioFinished (Winner PlayerShip)) (combatStatus finishedWreck)
+  -- The autopilot is asked directly, at the tick it would otherwise have locked
+  -- on: a wreck places nothing, and neither does anyone in a finished scenario.
+  assertEqual "a disabled enemy places no orders" [] (enemyGunneryOrders (armedWreck {combatTick = enemyLockDelayTicks}))
+  assertEqual "the same state with a live hull places the lock" [Lock EnemyShip PlayerShip] (enemyGunneryOrders (caravelaDuel {combatTick = enemyLockDelayTicks}))
+  assertEqual "a finished scenario's enemy places no orders" [] (enemyGunneryOrders (armedWreck {combatTick = enemyLockDelayTicks, combatStatus = ScenarioFinished (Winner PlayerShip)}))
+
+
+-- | The enemy never withdraws the permission it granted itself. Once armed, no
+-- later tick may disarm it — not the reload it waits on, and not the volley that
+-- starts one — and the lock that produced the arming is never released either.
+--
+-- Read off the live duel rather than a fixture: the arming is the autopilot's own,
+-- so the sequence is the one the game produces. It does fire during it, which the
+-- player's hull shows.
+testEnemyNeverWithdrawsPermission :: IO ()
+testEnemyNeverWithdrawsPermission = do
+  let afterArming = advanceTicks (enemyLockDelayTicks + 1) engagedDuel
+  assertEqual "the enemy is permitted by the tick after it locks" True (shipFirePermission (combatEnemy afterArming))
+  assertEqual "the enemy's volley starts its reload" reloadTicks (shipReload (combatEnemy afterArming))
+  assertEqual "the enemy holds the lock it acquired" (Just PlayerShip) (shipLockedTarget (combatEnemy afterArming))
+  assertEqual "the enemy damaged the player on the tick it armed" 75 (shipHull (combatPlayer afterArming))
+  disarmed <- firstDisarmAfterArming 12 engagedDuel
+  assertEqual "no later tick withdraws the permission the enemy granted itself" Nothing disarmed
+
+-- | The first tick on which the enemy held a lock, had been permitted to fire, and
+-- was then found without that permission — the autopilot disarming itself.
+-- 'Nothing' when it never does.
+firstDisarmAfterArming :: Int -> CombatState -> IO (Maybe Int)
+firstDisarmAfterArming remaining state = go remaining state False
+ where
+  go left current wasArmed
+    | left <= 0 = pure Nothing
+    | wasArmed && shipLockedTarget enemy == Nothing = pure (Just (combatTick current))
+    | wasArmed && not (shipFirePermission enemy) = pure (Just (combatTick current))
+    | otherwise = go (left - 1) (tickCombat [] current) (wasArmed || shipFirePermission enemy)
+   where
+    enemy = combatEnemy current
+
+-- | The gunnery work does not disturb the orbit: while the enemy is locked and
+-- armed, the autopilot keeps issuing waypoints on the fixed ring around the arena
+-- centre, and the ship keeps clearing them and advancing to the next.
+testEnemyOrbitKeepsAdvancingWhileEngaged :: IO ()
+testEnemyOrbitKeepsAdvancingWhileEngaged = do
+  let
+    locked = advanceTicks enemyLockDelayTicks caravelaDuel
+    afterFirstWaypoint = advanceTicks 16 caravelaDuel
+    centre = enemyOrbitCenter (combatEnemyOrbitAutopilot locked)
+  assertEqual "the enemy is engaged by the tick it locks" (Just PlayerShip) (shipLockedTarget (combatEnemy locked))
+  assertEqual "the enemy still holds an orbit order while engaged" True (shipNavigationOrder (combatEnemy locked) /= Nothing)
+  assertEqual
+    "the autopilot consumed the first orbit waypoint"
+    True
+    (enemyOrbitNextWaypointIndex (combatEnemyOrbitAutopilot afterFirstWaypoint) > enemyOrbitNextWaypointIndex (combatEnemyOrbitAutopilot locked))
+  assertEqual "the enemy holds a further orbit order after clearing one" True (shipNavigationOrder (combatEnemy afterFirstWaypoint) /= Nothing)
+  assertEqual "the gunnery work leaves the arena centre alone" (Point 0 40) centre
+  assertEqual "the enemy is still engaged after clearing a waypoint" True (shipFirePermission (combatEnemy afterFirstWaypoint))
+  forM_ [4, 8, 12, 16] $ \ticks ->
+    assertEqual
+      ("the orbit order at tick " <> show ticks <> " sits on the fixed ring")
+      True
+      (orbitOrderOnTheRing centre (advanceTicks ticks caravelaDuel))
+
+-- | Whether the enemy's current orbit order aims at a waypoint on the ring the
+-- autopilot draws around its centre.
+orbitOrderOnTheRing :: Point -> CombatState -> Bool
+orbitOrderOnTheRing centre state =
+  case shipNavigationOrder (combatEnemy state) of
+    Nothing -> False
+    Just order -> abs (pointDistance centre (navigationRequestedWaypoint order) - enemyOrbitRadius) < 0.0001
+
+-- | The whole fight through the local API, with the enemy driving itself: it
+-- closes, locks the player, arms its guns and damages the player, all of it
+-- through the same tick and the same commands a player's orders go through.
+--
+-- Nothing here writes the enemy's fire-control state: its lock, its permission
+-- and the damage it deals are read from the snapshot the client reads.
+--
+-- The player is stopped and holds its fire, which is the geometry that lets the
+-- fight happen at all: the duel opens outside both ships' 48-unit reach, so an
+-- enemy circling a 24-unit ring only closes once the player stops running, and a
+-- player who shoots back disables an 80-hull boat before it gets a second volley
+-- away. Both of those are balance, not mechanism — this test is about the enemy
+-- getting its shots off through the shared path.
+testLocalApiEnemyClosesLocksArmsAndDamagesThePlayer :: IO ()
+testLocalApiEnemyClosesLocksArmsAndDamagesThePlayer = do
+  config <- expectRight "load packaged config for the enemy's fight" =<< loadRuntimeCombatConfig
+  localApi <- newConfiguredLocalCombatApi config
+  let api = localCombatApi localApi
+  start <- expectRight "start the shipped duel for the enemy's fight" =<< combatApiStartScenario api caravelaDuelScenarioId
+  _ <- queueLocalCommand "queue player furl sails" api (SetSails PlayerShip SailsFurled)
+  _ <- queueLocalCommand "queue the player's lock" api (Lock PlayerShip EnemyShip)
+  undamagedPlayer <- expectShipSnapshot "player before the enemy's first volley" PlayerShip start
+  (firstHitTick, firstHit) <- advanceUntilTheEnemyDrawsBlood 40 "advance the shipped duel until the enemy draws blood" (shipSnapshotHull undamagedPlayer) api
+  firstHitPlayer <- expectShipSnapshot "player after the enemy's first volley" PlayerShip firstHit
+  firstHitEnemy <- expectShipSnapshot "enemy after its first volley" EnemyShip firstHit
+  (secondHitTick, secondHit) <- advanceUntilTheEnemyDrawsBlood 20 "advance the shipped duel until the enemy fires again" (shipSnapshotHull firstHitPlayer) api
+  secondHitPlayer <- expectShipSnapshot "player after the enemy's second volley" PlayerShip secondHit
+  secondHitEnemy <- expectShipSnapshot "enemy after its second volley" EnemyShip secondHit
+  assertEqual "the enemy's close and volley damage the player through the shared phase" 135 (shipSnapshotHull firstHitPlayer)
+  assertEqual "the enemy acquired its lock through the ordinary lock command" (Just PlayerShip) (shipSnapshotLockedTarget firstHitEnemy)
+  assertEqual "the enemy granted itself permission through the ordinary command" True (shipSnapshotFirePermission firstHitEnemy)
+  assertEqual "the enemy's first volley starts its reload" reloadTicks (shipSnapshotReloadTicksRemaining firstHitEnemy)
+  assertEqual "the enemy's next volley waits out the same shared reload" reloadTicks (secondHitTick - firstHitTick)
+  assertEqual "the enemy's second volley damages the player again" 110 (shipSnapshotHull secondHitPlayer)
+  assertEqual "the enemy never withdraws the permission it granted itself" True (shipSnapshotFirePermission secondHitEnemy)
+  assertEqual "the enemy still holds the player it locked" (Just PlayerShip) (shipSnapshotLockedTarget secondHitEnemy)
+
+-- | Advance the local API until the enemy has taken hull off the player, and
+-- report the tick the damage appeared on. The damage is read only from the
+-- snapshot, so it cannot be the test's own doing.
+advanceUntilTheEnemyDrawsBlood :: Int -> String -> Int -> CombatApi IO -> IO (Int, CombatSnapshot)
+advanceUntilTheEnemyDrawsBlood remaining label hullBefore api
+  | remaining <= 0 = die $ label <> ": the enemy never damaged the player before the test safety limit"
+  | otherwise = do
+      snapshot <- advanceLocalApiTick label api
+      player <- expectShipSnapshot label PlayerShip snapshot
+      if shipSnapshotHull player < hullBefore
+        then pure (combatSnapshotTick snapshot, snapshot)
+        else advanceUntilTheEnemyDrawsBlood (remaining - 1) label hullBefore api
+
+-- | The duel with the player parked on the enemy's port beam, forty units away,
+-- so the enemy's volleys land as soon as it arms its guns. Only the geometry is
+-- set here: the enemy's lock and permission are still acquired through the
+-- autopilot's own commands.
+engagedDuel :: CombatState
+engagedDuel =
+  caravelaDuel
+    { combatEnemy = (combatEnemy caravelaDuel) {shipPosition = Point 0 40}
+    , combatPlayer = (combatPlayer caravelaDuel) {shipPosition = Point 0 0}
+    }
+
+-- | Step the pure tick transition a fixed number of times.
+advanceTicks :: Int -> CombatState -> CombatState
+advanceTicks ticks state
+  | ticks <= 0 = state
+  | otherwise = advanceTicks (ticks - 1) (tickCombat [] state)
 
 testTerminalHullState :: IO ()
 testTerminalHullState = do
@@ -1689,6 +2017,18 @@ testLocalApiFiresAndWithdrawsThroughTheQueuedOrders = do
 -- | Volleys through the API until the duel ends: the winner is reported and a
 -- finished scenario stops advancing. Nothing but a volley takes a hull to zero,
 -- so this is also the API's proof that automatic fire ends a fight.
+--
+-- Issue 02 asserted here that the enemy never fires, because it held no lock. That
+-- reason is gone: the enemy holds a lock and its guns are armed, and this test now
+-- asserts exactly that. What keeps the player untouched is the fixture's geometry,
+-- and the refusal is the arc rather than the range: the enemy's sails are furled
+-- to hold it still, which leaves it bow-on to the bearing — the player sits about
+-- 76.5 units away at roughly 90 degrees off both beams, so neither broadside
+-- bears — and this legacy fixture's reach is 100, not the shipped 48, so 76.5
+-- units is comfortably inside it. Measured, not assumed. That the enemy does shoot
+-- when a broadside bears is 'testLocalApiEnemyClosesLocksArmsAndDamagesThePlayer'.
+-- This test's subject is untouched: the API reports the winner, and a finished
+-- scenario stops advancing.
 testLocalApiReportsTerminalState :: IO ()
 testLocalApiReportsTerminalState = do
   (api, _) <- startLocalDuel
@@ -1707,7 +2047,9 @@ testLocalApiReportsTerminalState = do
   assertEqual "the first volley leaves the enemy damaged" 75 (shipSnapshotHull firstEnemy)
   assertEqual "the volleys disable the enemy" 0 (shipSnapshotHull enemy)
   assertEqual "the API reports the player's victory" (ScenarioFinished (Winner PlayerShip)) (combatSnapshotStatus finished)
-  assertEqual "the enemy never fires: it holds no lock" 100 (shipSnapshotHull player)
+  assertEqual "the enemy held the lock and the arm order it placed through the commands" (Just PlayerShip, True) (shipSnapshotLockedTarget enemy, shipSnapshotFirePermission enemy)
+  assertEqual "the player takes nothing: the pinned enemy is bow-on to the bearing" 100 (shipSnapshotHull player)
+  assertEqual "so neither of the enemy's broadsides bears on the player" (False, False) (shipSnapshotPortHoldsTarget enemy, shipSnapshotStarboardHoldsTarget enemy)
   assertEqual "a finished API scenario stops advancing" (combatSnapshotTick finished) (combatSnapshotTick afterFinished)
   assertEqual "a finished API snapshot stays terminal" (combatSnapshotStatus finished) (combatSnapshotStatus afterFinished)
 
