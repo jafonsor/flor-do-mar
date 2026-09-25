@@ -203,6 +203,16 @@ rewriting. All give every CDP command a hard deadline, so a stalled page is a
   mouseleave leave a committed order alone, drag works). Its last check, "enemy
   keeps manoeuvring", samples headings for 5.4 s and can fail on a long straight
   leg; confirm against a fresh page before calling it a regression.
+- `cdp-firing-loop.mjs` — drives the whole fire-control loop on a live page and
+  captures the canvas where the pure suite cannot look: the gun panel is an
+  overlay that passes pointer events through, a click on open water still
+  navigates, a sweep finds a hull and clicking it locks it, the toggle's colour
+  flips before the tick that processes the order, a volley leaves when the target
+  comes into reach, and disengaging mid-reload stops the next one while the sweep
+  still completes. It writes the frame it captured while a wedge was on screen, so
+  run it after any change to the battle view, the panel or the envelope. Its
+  gunnery readout is parsed per panel, not from the whole body text, because the
+  panel's own heading comes first in the gunnery panel's `innerText`.
 - `cdp-epoch-recovery.mjs` — the gate for the stale-page fix. Drives a page,
   replaces the client under it via `restart-3911.sh`, and asserts the page reloads
   itself and resumes ticking. Run it after any change to how the page is served.
