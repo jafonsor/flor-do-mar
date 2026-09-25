@@ -54,8 +54,8 @@ serverPort = 3911
 -- and polls @\/epoch@ for the token of the process that is serving it now.
 processEpoch :: IO Text
 processEpoch = do
-  now <- getPOSIXTime
-  pure . Text.pack . show $ (round (realToFrac now * 1000) :: Integer)
+  startedAt <- getPOSIXTime
+  pure . Text.pack . show $ (round ((realToFrac startedAt :: Double) * 1000) :: Integer)
 
 -- | Serve the page shell with the restart check in it.
 --
@@ -308,9 +308,13 @@ shipPanel title identity snapshotDynamic =
     el "h2" $ text title
     dynText (shipLine identity <$> snapshotDynamic)
 
--- | A placeholder readout of each ship's fire-control state until the gun panel
--- arrives. It reads the snapshot and nothing else: it does not re-derive a
--- broadside verdict, which is the snapshot's to publish.
+-- | The text readout of each ship's fire-control state.
+--
+-- It stays beside the gun panel on purpose. The client's DOM text is the
+-- cheapest ground truth a browser harness has for lock, permission and reload
+-- (docs/agents/testing-and-tooling.md), and it is the only place those numbers
+-- are labelled per ship: the panel over the canvas carries no ship labels,
+-- because the harnesses split the body text on the words Player and Enemy.
 gunneryPanel :: Dynamic DomTimeline CombatSnapshot -> Widget x ()
 gunneryPanel snapshotDynamic =
   elClass "article" "panel" $ do
@@ -467,6 +471,22 @@ stylesheet =
     , ".panel { border: 1px solid #203447; border-radius: 8px; padding: 12px; min-height: 74px; background: #0b1720; font-size: 13px; line-height: 1.45; }"
     , "button { border: 1px solid #2d506a; border-radius: 6px; background: #102536; color: #e6edf3; padding: 8px 10px; font: inherit; cursor: pointer; }"
     , "button:hover { background: #17344a; }"
+    , ".battle-view { position: relative; max-width: 760px; }"
+    -- The panel is an overlay: the container takes no pointer events, and only
+    -- its controls ask for them back. A container that captured them would
+    -- swallow the canvas mousedown/mousemove/mouseup stream navigation needs.
+    , ".gun-panel { position: absolute; top: 8px; left: 8px; display: flex; align-items: center; gap: 10px; padding: 6px 8px; border: 1px solid #203447; border-radius: 8px; background: rgba(7, 16, 23, 0.72); pointer-events: none; }"
+    , ".gun-panel .gun-control { pointer-events: auto; }"
+    , ".fire-toggle.disengaged { border-color: #2d506a; color: #9fb6c9; }"
+    , ".fire-toggle.armed { border-color: #f0b429; background: #3a2a08; color: #ffd166; }"
+    , ".gun-control[disabled] { opacity: 0.45; cursor: not-allowed; }"
+    , ".gun-control[disabled]:hover { background: #102536; }"
+    , ".lock-control.inactive { display: none; }"
+    , ".reload-circle { display: block; }"
+    , ".reload-track { fill: none; stroke: #22384a; stroke-width: 3; }"
+    , ".reload-fill { fill: none; stroke-width: 3; stroke-linecap: round; }"
+    , ".reload-circle.armed .reload-fill { stroke: #ffd166; }"
+    , ".reload-circle.disengaged .reload-fill { stroke: #6f8ea3; }"
     , ".setup-overlay { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 24px; background: rgba(2, 10, 16, 0.8); }"
     , ".setup-panel { width: min(440px, 100%); border: 1px solid #3d627e; border-radius: 8px; padding: 20px; background: #0b1720; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45); }"
     , ".boat-kind-choice { margin: 16px 0; }"

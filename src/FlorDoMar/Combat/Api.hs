@@ -14,6 +14,7 @@ module FlorDoMar.Combat.Api
   , combatSnapshotFromState
   , combatSnapshotFromStateWith
   , combatSnapshotFromStateWithPlanning
+  , findSnapshotShip
   , planNavigationForSnapshot
   , shipFromSnapshot
   )

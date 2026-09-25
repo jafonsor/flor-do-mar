@@ -52,6 +52,7 @@ executable flor-do-mar-client
     FlorDoMar.Client.BattleInput
     FlorDoMar.Client.BattleScene
     FlorDoMar.Client.BattleView
+    FlorDoMar.Client.GunPanel
     FlorDoMar.Client.Render.Scene
     FlorDoMar.Client.WebGL.Camera
     FlorDoMar.Client.WebGL.DrawBatch
@@ -85,6 +86,7 @@ test-suite combat-test
   other-modules:
     FlorDoMar.Client.BattleInput
     FlorDoMar.Client.BattleScene
+    FlorDoMar.Client.GunPanel
     FlorDoMar.Client.Render.Scene
     FlorDoMar.Client.WebGL.Camera
     FlorDoMar.Client.WebGL.Geometry

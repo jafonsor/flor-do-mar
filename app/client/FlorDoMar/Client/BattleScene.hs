@@ -3,17 +3,23 @@
 
 module FlorDoMar.Client.BattleScene
   ( BattleScene (..)
+  , ReticleState (..)
   , ShipMarker (..)
   , battleCamera
+  , battleCanvasSize
   , battleRenderScene
   , battleRenderSceneFromSnapshot
   , battleSceneFromSnapshot
   , battleSceneFromSnapshotWithHover
   , battleSceneFromSnapshotWithNavigationGesture
   , battleSceneFromSnapshotWithNavigationGestureAndDebug
+  , battleSceneFromSnapshotWithReticle
+  , restingReticleState
   )
 where
 
+import Control.Monad (guard)
+import Data.List (find)
 import Data.Text (Text)
 import FlorDoMar.Client.BattleInput
 import FlorDoMar.Client.Render.Scene
@@ -29,8 +35,26 @@ data BattleScene = BattleScene
   , battleSceneDebugOverlaysEnabled :: Bool
   , battleSceneHoverNavigationPlan :: Maybe NavigationPlan
   , battleSceneNavigationGesture :: NavigationGesture
+  , battleSceneReticle :: ReticleState
   }
   deriving stock (Eq, Show)
+
+-- | What the pointer is doing: the radius every reticle is drawn at, and the
+-- ship the pointer is over, if any.
+--
+-- The radius is carried rather than recomputed here because it is a screen-space
+-- constant converted at the canvas size the pointer actually arrived in, and the
+-- hit test that found the hovered ship ran at this same number.
+data ReticleState = ReticleState
+  { reticleStateRadius :: Double
+  , reticleStateHoveredShip :: Maybe ShipId
+  }
+  deriving stock (Eq, Show)
+
+-- | The reticle at rest: the radius the shipped canvas gives it, hovering
+-- nothing. The scene builders that take no pointer state start here.
+restingReticleState :: ReticleState
+restingReticleState = ReticleState (screenReticleRadius battleCamera battleCanvasSize) Nothing
 
 -- | What the battle view draws about one ship.
 --
@@ -41,7 +65,8 @@ data BattleScene = BattleScene
 -- verdict in particular is not recomputed here: a client that derived the
 -- highlight from the geometry itself could disagree with the guns.
 data ShipMarker = ShipMarker
-  { markerName :: Text
+  { markerIdentity :: ShipId
+  , markerName :: Text
   , markerPosition :: Point
   , markerHeading :: Heading
   , markerTargetHeading :: Heading
@@ -64,18 +89,25 @@ data ShipMarker = ShipMarker
   deriving stock (Eq, Show)
 
 battleSceneFromSnapshot :: CombatSnapshot -> BattleScene
-battleSceneFromSnapshot = battleSceneFromSnapshotWithNavigationGestureAndDebug False True Nothing NoNavigationGesture
+battleSceneFromSnapshot =
+  battleSceneFromSnapshotWithReticle restingReticleState False True Nothing NoNavigationGesture
 
 battleSceneFromSnapshotWithHover :: Bool -> Maybe Point -> CombatSnapshot -> BattleScene
 battleSceneFromSnapshotWithHover setupIsOpen hoverWaypoint =
-  battleSceneFromSnapshotWithNavigationGestureAndDebug setupIsOpen True hoverWaypoint NoNavigationGesture
+  battleSceneFromSnapshotWithReticle restingReticleState setupIsOpen True hoverWaypoint NoNavigationGesture
 
 battleSceneFromSnapshotWithNavigationGesture :: Bool -> Maybe Point -> NavigationGesture -> CombatSnapshot -> BattleScene
-battleSceneFromSnapshotWithNavigationGesture setupIsOpen hoverWaypoint navigationGesture snapshot =
-  battleSceneFromSnapshotWithNavigationGestureAndDebug setupIsOpen True hoverWaypoint navigationGesture snapshot
+battleSceneFromSnapshotWithNavigationGesture setupIsOpen hoverWaypoint navigationGesture =
+  battleSceneFromSnapshotWithReticle restingReticleState setupIsOpen True hoverWaypoint navigationGesture
 
 battleSceneFromSnapshotWithNavigationGestureAndDebug :: Bool -> Bool -> Maybe Point -> NavigationGesture -> CombatSnapshot -> BattleScene
-battleSceneFromSnapshotWithNavigationGestureAndDebug setupIsOpen debugOverlaysEnabled hoverWaypoint navigationGesture snapshot =
+battleSceneFromSnapshotWithNavigationGestureAndDebug setupIsOpen debugOverlaysEnabled hoverWaypoint navigationGesture =
+  battleSceneFromSnapshotWithReticle restingReticleState setupIsOpen debugOverlaysEnabled hoverWaypoint navigationGesture
+
+-- | The whole scene: the snapshot, the navigation overlay state, the overlay
+-- switches, and what the pointer is doing.
+battleSceneFromSnapshotWithReticle :: ReticleState -> Bool -> Bool -> Maybe Point -> NavigationGesture -> CombatSnapshot -> BattleScene
+battleSceneFromSnapshotWithReticle reticle setupIsOpen debugOverlaysEnabled hoverWaypoint navigationGesture snapshot =
   BattleScene
     { battleSceneShips = fmap shipMarker (combatSnapshotShips snapshot)
     , battleSceneStatus = combatSnapshotStatus snapshot
@@ -86,6 +118,7 @@ battleSceneFromSnapshotWithNavigationGestureAndDebug setupIsOpen debugOverlaysEn
           then hoverWaypoint >>= planNavigationForSnapshot snapshot PlayerShip
           else Nothing
     , battleSceneNavigationGesture = navigationGesture
+    , battleSceneReticle = reticle
     }
 
 battleRenderSceneFromSnapshot :: CombatSnapshot -> RenderScene
@@ -101,6 +134,7 @@ battleRenderScene scene =
           <> activeNavigationNodes scene
           <> hoverNavigationNodes scene
           <> navigationGestureNodes scene
+          <> reticleNodes scene
     }
 
 -- | The battle view's fixed camera.
@@ -118,10 +152,19 @@ battleCamera =
     , cameraZoom = 0.6
     }
 
+-- | The size the battle canvas is served at, and the seed for the pointer's
+-- screen space before the first pointer event arrives.
+--
+-- The canvas element's width and height attributes are built from it, so the
+-- drawing buffer and the pointer's pixel space start out the same size.
+battleCanvasSize :: ScreenSize
+battleCanvasSize = ScreenSize 760 428
+
 shipMarker :: ShipSnapshot -> ShipMarker
 shipMarker ship =
   ShipMarker
-    { markerName = shipSnapshotDisplayName ship
+    { markerIdentity = shipSnapshotId ship
+    , markerName = shipSnapshotDisplayName ship
     , markerPosition = shipSnapshotPosition ship
     , markerHeading = shipSnapshotHeading ship
     , markerTargetHeading = shipSnapshotTargetHeading ship
@@ -212,12 +255,12 @@ navigationGestureNodes scene =
     then []
     else
       case battleSceneNavigationGesture scene of
-        NavigationGesture waypoint maximumSpeed (Just selectedSpeed) ->
+        NavigationGesture press (Just selectedSpeed) ->
           [ RingStroke
               "drag-speed-ring:player"
-              (waypointTransformAtHeight waypoint dragOverlayHeight)
+              (waypointTransformAtHeight (navigationPressReachableWaypoint press) dragOverlayHeight)
               ringCenter
-              (speedRingRadius maximumSpeed selectedSpeed)
+              (speedRingRadius (navigationPressMaximumSpeed press) selectedSpeed)
               speedRingSegments
               dragSpeedRingStyle
           ]
@@ -228,6 +271,71 @@ playerMaxSpeed scene =
   case filter markerIsPlayer (battleSceneShips scene) of
     marker : _ -> markerMaxSpeed marker
     [] -> 0
+
+-- | The two reticles: a hover ring on the ship a click would lock, and a ring on
+-- the ship already locked. Both are drawn at the one reticle radius and differ
+-- only in colour, so committing to a lock is a colour change rather than a shape
+-- change.
+--
+-- The rings use the pointer's own radius — the number the hit test that set the
+-- hover ran with — so a hover ring is a promise about where the click lands. The
+-- hover ring is not drawn on the ship that is already locked: a click there
+-- releases the lock, so that ship's marker is the locked ring.
+reticleNodes :: BattleScene -> [RenderNode]
+reticleNodes scene =
+  hoverReticleNodes scene <> lockedReticleNodes scene
+
+hoverReticleNodes :: BattleScene -> [RenderNode]
+hoverReticleNodes scene
+  | not (battleScenePlanningEnabled scene) = []
+  | otherwise =
+      case hoveredMarker scene of
+        Just marker -> [reticleNode "hover-reticle" hoverReticleStyle scene marker]
+        Nothing -> []
+
+lockedReticleNodes :: BattleScene -> [RenderNode]
+lockedReticleNodes scene =
+  case lockedTargetMarker scene of
+    Just marker -> [reticleNode "locked-reticle" lockedReticleStyle scene marker]
+    Nothing -> []
+
+reticleNode :: Text -> StrokeStyle -> BattleScene -> ShipMarker -> RenderNode
+reticleNode prefix style scene marker =
+  RingStroke
+    (meshName prefix marker)
+    (waypointTransformAtHeight (markerPosition marker) reticleHeight)
+    ringCenter
+    (realToFrac (reticleStateRadius (battleSceneReticle scene)))
+    speedRingSegments
+    style
+
+-- | The ship the pointer is over, when it is one a click would lock. The
+-- player's own hull is never drawn as a lock candidate, and the ship already
+-- locked wears the locked ring instead.
+hoveredMarker :: BattleScene -> Maybe ShipMarker
+hoveredMarker scene = do
+  hovered <- reticleStateHoveredShip (battleSceneReticle scene)
+  marker <- markerForShip scene hovered
+  guard (not (markerIsPlayer marker))
+  guard (Just hovered /= lockedTargetId scene)
+  pure marker
+
+-- | The ship the player has locked, when the scene carries it.
+lockedTargetMarker :: BattleScene -> Maybe ShipMarker
+lockedTargetMarker scene = do
+  target <- lockedTargetId scene
+  marker <- markerForShip scene target
+  guard (not (markerIsPlayer marker))
+  pure marker
+
+lockedTargetId :: BattleScene -> Maybe ShipId
+lockedTargetId scene = do
+  player <- find markerIsPlayer (battleSceneShips scene)
+  markerLockedTarget player
+
+markerForShip :: BattleScene -> ShipId -> Maybe ShipMarker
+markerForShip scene identity =
+  find ((== identity) . markerIdentity) (battleSceneShips scene)
 
 navigationNodeName :: Text -> ShipMarker -> Text
 navigationNodeName prefix marker =
@@ -266,6 +374,12 @@ hoverOverlayHeight = 0.15
 dragOverlayHeight :: Scalar
 dragOverlayHeight = 0.2
 
+-- | The reticles sit above the hull rather than inside it. A ship's own z extent
+-- reaches 0.125 — a unit cube scaled to 0.25 in z — so an overlay at the
+-- existing 0.1 to 0.2 heights would be buried in the hull it marks.
+reticleHeight :: Scalar
+reticleHeight = 0.3
+
 speedRingMaximumRadius :: Scalar
 speedRingMaximumRadius = 8
 
@@ -292,6 +406,19 @@ hoverArrivalSpeedRingStyle = strokeStyle 0.8 (color 0.95 0.58 0.24 0.95)
 
 dragSpeedRingStyle :: StrokeStyle
 dragSpeedRingStyle = strokeStyle 0.9 (color 0.35 1 0.56 1)
+
+-- | The hover reticle: pale and cool, the marker for a click that would take a
+-- lock.
+hoverReticleStyle :: StrokeStyle
+hoverReticleStyle = strokeStyle reticleStrokeWidth (color 0.82 0.9 1 0.85)
+
+-- | The locked reticle: the same ring in a hot colour, so the lock reads as a
+-- change of state rather than a change of shape.
+lockedReticleStyle :: StrokeStyle
+lockedReticleStyle = strokeStyle reticleStrokeWidth (color 1 0.72 0.2 1)
+
+reticleStrokeWidth :: Scalar
+reticleStrokeWidth = 0.5
 
 shipMeshes :: ShipMarker -> [RenderMesh]
 shipMeshes marker =

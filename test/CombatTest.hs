@@ -8,6 +8,7 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import FlorDoMar.Client.BattleInput
 import FlorDoMar.Client.BattleScene
+import FlorDoMar.Client.GunPanel
 import FlorDoMar.Client.Render.Scene
 import FlorDoMar.Client.WebGL.Camera
 import FlorDoMar.Client.WebGL.Geometry
@@ -113,6 +114,15 @@ main = do
   testEnemyDebugNavigationRenderScene
   testBattleInputHoverIntent
   testBattleInputMouseNavigationGesture
+  testReticleRadiusIsOneScreenSpaceNumber
+  testReticleHitTest
+  testReticleHoverFollowsTheSnapshot
+  testNavigationReleaseSplitsClickFromDrag
+  testReticleRenderScene
+  testGunPanelReloadProgress
+  testGunPanelToggleIsClickableOnlyWhenItCanAct
+  testGunPanelShowsTheRequestedStateUntilATickDecidesIt
+  testGunPanelLockControlNeedsALockableTarget
   testHoverNavigationRenderScene
   testHoverNavigationIsHiddenOutsideActiveBattleView
   testSetupOverlayBlocksNavigation
@@ -2692,7 +2702,7 @@ testBattleInputMouseNavigationGesture = do
           (combatSnapshotFromState caravelaDuelScenario caravelaDuel)
   assertEqual
     "primary mouse down becomes a semantic navigation intent"
-    (NavigationPointerPrimaryDown (Point 0 40))
+    (NavigationPointerPrimaryDown (PointerSample (Point 0 40) expectedReticleRadius))
     mouseDownIntent
   assertEqual "tight gesture plan is clamped" True (navigationPlanWasClamped tightPlan)
   assertEqual "drag gesture centers on the reachable waypoint" False (reachableWaypoint == Point 0.5 0)
@@ -2707,6 +2717,409 @@ testBattleInputMouseNavigationGesture = do
     (vec3 (realToFrac (pointX reachableWaypoint)) (realToFrac (pointY reachableWaypoint)) 0.2)
     (transformPosition dragRingTransform)
   assertApproxScalar "drag speed ring previews the selected speed" 4 dragRingRadius
+
+-- | The reticle is one screen-space number.
+--
+-- The radius a click is hit-tested with, the radius the hover ring is drawn at
+-- and the radius the locked ring is drawn at are the same 24 canvas pixels,
+-- converted once through the same screen-to-battle maths the pointer position
+-- goes through. That is what makes a ring a promise about where the click lands.
+testReticleRadiusIsOneScreenSpaceNumber :: IO ()
+testReticleRadiusIsOneScreenSpaceNumber = do
+  let
+    centre = canvasPointer (ScreenPoint 380 214)
+    edge = canvasPointer (ScreenPoint (380 + reticleRadiusPixels) 214)
+    justInside = canvasPointer (ScreenPoint (380 + reticleRadiusPixels - 0.5) 214)
+    justOutside = canvasPointer (ScreenPoint (380 + reticleRadiusPixels + 0.5) 214)
+  assertApprox "the reticle is 24 canvas pixels" 24 reticleRadiusPixels
+  assertApprox
+    "24 canvas pixels convert to exactly the reticle's battle radius"
+    (pointerSampleReticleRadius centre)
+    (pointDistance (pointerSamplePoint centre) (pointerSamplePoint edge))
+  assertEqual
+    "a point half a pixel inside the ring is inside the radius"
+    True
+    (pointDistance (pointerSamplePoint centre) (pointerSamplePoint justInside) < pointerSampleReticleRadius centre)
+  assertEqual
+    "a point half a pixel outside the ring is outside the radius"
+    True
+    (pointDistance (pointerSamplePoint centre) (pointerSamplePoint justOutside) > pointerSampleReticleRadius centre)
+  -- The screen space the pointer arrives in is the canvas's displayed size, not
+  -- the drawing buffer: the same 24 pixels span twice the world distance when
+  -- the element is displayed at half width.
+  assertApprox
+    "the reticle scales with the canvas's displayed size"
+    (2 * pointerSampleReticleRadius centre)
+    (screenReticleRadius battleCamera (ScreenSize 380 214))
+
+-- | The screen-space hit test: a hull under the reticle is hit, a hull just
+-- outside it is not, open water is not, and the player's own hull never is.
+testReticleHitTest :: IO ()
+testReticleHitTest = do
+  let
+    snapshot = combatSnapshotFromState caravelaDuelScenario caravelaDuel
+    ships = combatSnapshotShips snapshot
+    radius = expectedReticleRadius
+  enemy <- expectShipSnapshot "reticle hit test enemy" EnemyShip snapshot
+  player <- expectShipSnapshot "reticle hit test player" PlayerShip snapshot
+  let
+    enemyPosition = shipSnapshotPosition enemy
+    playerPosition = shipSnapshotPosition player
+    at offset = PointerSample (offsetPoint enemyPosition offset 0) radius
+    openWater = PointerSample (Point 60 60) radius
+  assertEqual "a point at the reticle's centre hits that ship" (Just EnemyShip) (reticleShip PlayerShip (at 0) ships)
+  assertEqual "a point just inside the reticle still hits" (Just EnemyShip) (reticleShip PlayerShip (at (radius - 0.5)) ships)
+  assertEqual "a point just outside the reticle misses" Nothing (reticleShip PlayerShip (at (radius + 0.5)) ships)
+  assertEqual "the player's own hull is never a lock candidate" Nothing (reticleShip PlayerShip (PointerSample playerPosition radius) ships)
+  assertEqual "an unhovered ship is not hit" Nothing (reticleShip PlayerShip openWater ships)
+  assertEqual "hovering a hull sets the hover state" (Just EnemyShip) (lockTargetAtSample PlayerShip snapshot (at 0))
+  assertEqual "hovering open water clears the hover state" Nothing (lockTargetAtSample PlayerShip snapshot openWater)
+  assertEqual "hovering the player's own hull is not a lock action" Nothing (lockTargetAtSample PlayerShip snapshot (PointerSample playerPosition radius))
+  -- The same boundary in the pointer's own space: a hull centred under the
+  -- pointer is hit, and the same hull one pixel outside the ring is not.
+  let
+    centrePointer = canvasPointer (ScreenPoint 380 214)
+    hullUnderPointer = enemy {shipSnapshotPosition = pointerSamplePoint centrePointer}
+    pointerAtPixels pixels = canvasPointer (ScreenPoint pixels 214)
+  assertEqual "a hull centred under the pointer is hit" (Just EnemyShip) (reticleShip PlayerShip centrePointer [hullUnderPointer])
+  assertEqual
+    "a hull one pixel outside the reticle is not hit"
+    Nothing
+    (reticleShip PlayerShip (pointerAtPixels (380 + reticleRadiusPixels + 1)) [hullUnderPointer])
+
+-- | The gesture split, decided at release from what the press was: a click on a
+-- hull the player may lock toggles the lock and navigates nowhere, a click on the
+-- player's own hull asks for nothing at all, and every other release — including
+-- every drag, and every drag that started on a hull — is a navigation order.
+-- | The hover is re-derived from the pointer's last position against every
+-- snapshot, not folded from pointer events, because a ship moves under a pointer
+-- that is holding still. A hover kept from the last pointer event would leave the
+-- ring on a hull the pointer has left — and the click that follows hit-tests the
+-- press afresh — so the marker would lie about where the gesture lands.
+testReticleHoverFollowsTheSnapshot :: IO ()
+testReticleHoverFollowsTheSnapshot = do
+  let
+    snapshot = combatSnapshotFromState caravelaDuelScenario caravelaDuel
+    radius = expectedReticleRadius
+  enemy <- expectShipSnapshot "hover follows the snapshot enemy" EnemyShip snapshot
+  player <- expectShipSnapshot "hover follows the snapshot player" PlayerShip snapshot
+  let
+    enemyPosition = shipSnapshotPosition enemy
+    playerPosition = shipSnapshotPosition player
+    onEnemy = PointerSample enemyPosition radius
+    movedSnapshot =
+      snapshot
+        { combatSnapshotShips = fmap (moveHullAway radius) (combatSnapshotShips snapshot)
+        }
+    moveHullAway distance ship
+      | shipSnapshotId ship == EnemyShip =
+          ship {shipSnapshotPosition = offsetPoint (shipSnapshotPosition ship) (2 * distance) 0}
+      | otherwise = ship
+  assertEqual
+    "an unchanged sample on an unchanged snapshot keeps the hover"
+    (Just EnemyShip)
+    (hoveredShipAt PlayerShip (Just onEnemy) snapshot)
+  assertEqual
+    "the hover is the click's own hit test"
+    (lockTargetAtSample PlayerShip snapshot onEnemy)
+    (hoveredShipAt PlayerShip (Just onEnemy) snapshot)
+  assertEqual
+    "a ship that moves out from under a held pointer loses the hover on that snapshot"
+    Nothing
+    (hoveredShipAt PlayerShip (Just onEnemy) movedSnapshot)
+  assertEqual "no pointer sample clears the hover" Nothing (hoveredShipAt PlayerShip Nothing snapshot)
+  assertEqual
+    "no pointer sample leaves a moved snapshot nothing"
+    Nothing
+    (hoveredShipAt PlayerShip Nothing movedSnapshot)
+  assertEqual
+    "the player's own hull is never the hovered ship"
+    Nothing
+    (hoveredShipAt PlayerShip (Just (PointerSample playerPosition radius)) snapshot)
+
+testNavigationReleaseSplitsClickFromDrag :: IO ()
+testNavigationReleaseSplitsClickFromDrag = do
+  let
+    snapshot = combatSnapshotFromState caravelaDuelScenario caravelaDuel
+    status = combatSnapshotStatus snapshot
+    radius = expectedReticleRadius
+    waterPoint = Point 60 60
+  enemy <- expectShipSnapshot "release split enemy" EnemyShip snapshot
+  player <- expectShipSnapshot "release split player" PlayerShip snapshot
+  let
+    enemyPosition = shipSnapshotPosition enemy
+    playerPosition = shipSnapshotPosition player
+    at position = PointerSample position radius
+    pressAt pointer =
+      case planNavigationForSnapshot snapshot PlayerShip (pointerSamplePoint pointer) of
+        Nothing -> NoNavigationGesture
+        Just plan ->
+          beginNavigationGestureAt
+            (pointerSamplePoint pointer)
+            (navigationPlanReachableWaypoint plan)
+            6
+            (hullAtReticle pointer (combatSnapshotShips snapshot))
+    enemyPress = pressAt (at enemyPosition)
+    playerPress = pressAt (at playerPosition)
+    waterPress = pressAt (at waterPoint)
+    dragFrom gesture =
+      case gesture of
+        NavigationGesture press _ -> updateNavigationGesture (offsetPoint (navigationPressRequestedWaypoint press) 4 0) gesture
+        NoNavigationGesture -> NoNavigationGesture
+    enemyClick = navigationReleaseIntent PlayerShip status False enemyPress
+    waterClick = navigationReleaseIntent PlayerShip status False waterPress
+  assertEqual "a click on an enemy hull locks it" (Just (LockOnRelease EnemyShip)) enemyClick
+  assertEqual "a click on an enemy hull issues no navigation order" False (releaseNavigates enemyClick)
+  assertEqual "a click on the player's own hull asks for nothing at all" Nothing (navigationReleaseIntent PlayerShip status False playerPress)
+  assertEqual
+    "a drag that started on the player's own hull still navigates"
+    (Just (NavigateOnRelease playerPosition (navigationGestureSelectedSpeed (dragFrom playerPress))))
+    (navigationReleaseIntent PlayerShip status False (dragFrom playerPress))
+  assertEqual "a click on open water still issues a navigation order" (Just (NavigateOnRelease waterPoint Nothing)) waterClick
+  assertEqual "a click on open water navigates" True (releaseNavigates waterClick)
+  assertEqual
+    "a drag that started on a hull issues a navigation order rather than a lock"
+    (Just (NavigateOnRelease enemyPosition (Just 3)))
+    (navigationReleaseIntent PlayerShip status False (dragFrom enemyPress))
+  assertEqual
+    "a drag from open water issues a navigation order with the selected speed"
+    (Just (NavigateOnRelease waterPoint (Just 3)))
+    (navigationReleaseIntent PlayerShip status False (dragFrom waterPress))
+  assertEqual
+    "the lock target comes from the press, not the release"
+    (Just (NavigateOnRelease waterPoint (navigationGestureSelectedSpeed (updateNavigationGesture enemyPosition waterPress))))
+    (navigationReleaseIntent PlayerShip status False (updateNavigationGesture enemyPosition waterPress))
+  assertEqual "a release with no press asks for nothing" Nothing (navigationReleaseIntent PlayerShip status False NoNavigationGesture)
+  assertEqual "a click on a hull under the setup overlay asks for nothing" Nothing (navigationReleaseIntent PlayerShip status True enemyPress)
+  assertEqual
+    "a click on a hull in a finished scenario asks for nothing"
+    Nothing
+    (navigationReleaseIntent PlayerShip (ScenarioFinished (Winner PlayerShip)) False enemyPress)
+
+-- | The two reticles: a hover ring on the ship a click would lock, a ring on the
+-- ship already locked — the same size, differing only in colour, above the hull
+-- in z, and never drawn on the player's own ship.
+testReticleRenderScene :: IO ()
+testReticleRenderScene = do
+  let
+    unlockedSnapshot = combatSnapshotFromState caravelaDuelScenario caravelaDuel
+    lockedSnapshot =
+      panelSnapshotWith (withPlayerShip (\ship -> ship {shipLockedTarget = Just EnemyShip}))
+    hoveredReticle = restingReticleState {reticleStateHoveredShip = Just EnemyShip}
+    selfHoveredReticle = restingReticleState {reticleStateHoveredShip = Just PlayerShip}
+    sceneWith reticle snapshot =
+      battleRenderScene (battleSceneFromSnapshotWithReticle reticle False True Nothing NoNavigationGesture snapshot)
+    hoverScene = sceneWith hoveredReticle unlockedSnapshot
+    lockedScene = sceneWith restingReticleState lockedSnapshot
+    lockedHoverScene = sceneWith hoveredReticle lockedSnapshot
+    quietScene = sceneWith restingReticleState unlockedSnapshot
+    selfHoverScene = sceneWith selfHoveredReticle unlockedSnapshot
+  enemy <- expectShipSnapshot "reticle render enemy" EnemyShip unlockedSnapshot
+  (hoverTransform, hoverRadius, hoverStyle) <- expectRingStrokeStyle "hover-reticle:enemy" hoverScene
+  (lockedTransform, lockedRadius, lockedStyle) <- expectRingStrokeStyle "locked-reticle:enemy" lockedScene
+  enemyHull <- expectMesh "ship:enemy" hoverScene
+  let
+    hullTransform = renderMeshTransform enemyHull
+    hullTop = vec3Z (transformPosition hullTransform) + (vec3Z (transformScale hullTransform) / 2)
+    enemyPosition = shipSnapshotPosition enemy
+  assertEqual "the hover ring is drawn on the hovered ship" ["hover-reticle:enemy"] (reticleRingNames hoverScene)
+  assertEqual "the locked ring is drawn on the player's locked target" ["locked-reticle:enemy"] (reticleRingNames lockedScene)
+  assertEqual "no hover and no lock draws no reticle" [] (reticleRingNames quietScene)
+  assertEqual "hovering the player's own hull draws no lock candidate" [] (reticleRingNames selfHoverScene)
+  assertEqual "the locked ship wears the locked ring rather than a hover ring" ["locked-reticle:enemy"] (reticleRingNames lockedHoverScene)
+  assertApproxScalar "the hover ring is the pointer's reticle radius" (realToFrac expectedReticleRadius) hoverRadius
+  assertApproxScalar "the locked ring is the same size as the hover ring" hoverRadius lockedRadius
+  assertEqual
+    "the two reticles differ by colour"
+    True
+    (materialColor (strokeStyleMaterial hoverStyle) /= materialColor (strokeStyleMaterial lockedStyle))
+  assertColor "hover reticle colour" (color 0.82 0.9 1 0.85) (materialColor (strokeStyleMaterial hoverStyle))
+  assertColor "locked reticle colour" (color 1 0.72 0.2 1) (materialColor (strokeStyleMaterial lockedStyle))
+  assertApproxScalar "the hover ring is anchored to the hovered hull's x" (realToFrac (pointX enemyPosition)) (vec3X (transformPosition hoverTransform))
+  assertApproxScalar "the hover ring is anchored to the hovered hull's y" (realToFrac (pointY enemyPosition)) (vec3Y (transformPosition hoverTransform))
+  assertApproxScalar "the locked ring is anchored to the locked hull's x" (realToFrac (pointX enemyPosition)) (vec3X (transformPosition lockedTransform))
+  assertApproxScalar "the locked ring is anchored to the locked hull's y" (realToFrac (pointY enemyPosition)) (vec3Y (transformPosition lockedTransform))
+  assertEqual "the hull's own z extent reaches the 0.1 navigation overlay" True (hullTop > 0.1)
+  assertEqual "the hover ring sits above the hull rather than inside it" True (vec3Z (transformPosition hoverTransform) > hullTop)
+  assertEqual "the locked ring sits above the hull rather than inside it" True (vec3Z (transformPosition lockedTransform) > hullTop)
+  assertApproxScalar "both reticles sit at the same height" (vec3Z (transformPosition hoverTransform)) (vec3Z (transformPosition lockedTransform))
+
+-- | The reload circle is reload progress: empty at the volley that started the
+-- reload, full when the guns are loaded. Disengaging does not touch it, because
+-- the guns reload whether or not they are permitted to fire — so the sweep runs
+-- on to full and the control becomes clickable again when it gets there.
+testGunPanelReloadProgress :: IO ()
+testGunPanelReloadProgress = do
+  let
+    loaded = panelStateWith (\ship -> ship {shipReload = 0})
+    fresh = panelStateWith (\ship -> ship {shipReload = reloadTicks})
+    partway = panelStateWith (\ship -> ship {shipReload = reloadTicks - 1})
+    armedMidReload = panelStateWith (\ship -> ship {shipFirePermission = True, shipReload = reloadTicks - 1})
+    disengagedMidReload = panelStateWith (\ship -> ship {shipFirePermission = False, shipReload = reloadTicks - 1})
+    finishedSweep = panelStateWith (\ship -> ship {shipFirePermission = False, shipReload = 0})
+  assertApprox "a loaded ship's circle is full" 1 (gunPanelReloadProgress loaded)
+  assertApprox "a reload that has just started leaves the circle empty" 0 (gunPanelReloadProgress fresh)
+  assertApprox "a partly finished reload is part-way round" (1 / 3) (gunPanelReloadProgress partway)
+  assertEqual
+    "the circle reads the snapshot's own reload pair"
+    (reloadTicks - 1, reloadTicks)
+    (gunPanelReloadTicksRemaining partway, gunPanelReloadTicksTotal partway)
+  assertApprox "the sweep interpolates over one tick" 1 (gunPanelReloadSweepSeconds loaded)
+  assertApprox
+    "disengaging mid-reload leaves the sweep exactly where it was"
+    (gunPanelReloadProgress armedMidReload)
+    (gunPanelReloadProgress disengagedMidReload)
+  assertApprox "the sweep finishes full while still disengaged" 1 (gunPanelReloadProgress finishedSweep)
+  assertEqual "the control is not clickable to arm while the sweep runs" False (gunPanelToggleEnabled disengagedMidReload)
+  assertEqual "the control is always clickable to disengage" True (gunPanelToggleEnabled armedMidReload)
+  assertEqual "the control is clickable again once the sweep finishes" True (gunPanelToggleEnabled finishedSweep)
+
+-- | Arming is offered only when the guns are disengaged and loaded; disengaging
+-- is always offered.
+testGunPanelToggleIsClickableOnlyWhenItCanAct :: IO ()
+testGunPanelToggleIsClickableOnlyWhenItCanAct = do
+  let
+    disengagedLoaded = panelStateWith (\ship -> ship {shipFirePermission = False, shipReload = 0})
+    disengagedReloading = panelStateWith (\ship -> ship {shipFirePermission = False, shipReload = 1})
+    armedLoaded = panelStateWith (\ship -> ship {shipFirePermission = True, shipReload = 0})
+    armedReloading = panelStateWith (\ship -> ship {shipFirePermission = True, shipReload = 1})
+  assertEqual "the toggle shows the snapshot's permission" False (gunPanelArmed disengagedLoaded)
+  assertEqual "a disengaged ship with loaded guns can be armed" True (gunPanelToggleEnabled disengagedLoaded)
+  assertEqual "arming is not offered while the reload runs" False (gunPanelToggleEnabled disengagedReloading)
+  assertEqual "the toggle shows an armed ship as armed" True (gunPanelArmed armedLoaded)
+  assertEqual "an armed ship can always be disengaged" True (gunPanelToggleEnabled armedReloading)
+  assertEqual "an armed ship with loaded guns can be disengaged" True (gunPanelToggleEnabled armedLoaded)
+
+-- | The toggle is optimistic but honest: it shows the state the player asked for
+-- from the click until a later tick has published a snapshot, and that snapshot
+-- is then the truth whether it applied the order or refused it.
+testGunPanelShowsTheRequestedStateUntilATickDecidesIt :: IO ()
+testGunPanelShowsTheRequestedStateUntilATickDecidesIt = do
+  let
+    request = FireAtWillRequest True 0
+    clicked = panelSnapshotAt 0 False 0
+    submitted = panelSnapshotAt 0 False 0
+    refused = panelSnapshotAt 1 False 1
+    applied = panelSnapshotAt 1 True 1
+    afterClick = applyFireAtWillRequestUpdate (FireAtWillRequested request) Nothing
+    afterSubmission = applyFireAtWillRequestUpdate (FireAtWillSnapshot submitted) afterClick
+    afterRefusedTick = applyFireAtWillRequestUpdate (FireAtWillSnapshot refused) afterSubmission
+    afterAppliedTick = applyFireAtWillRequestUpdate (FireAtWillSnapshot applied) afterSubmission
+    armedOf snapshot outstanding = gunPanelArmed (gunPanelState snapshot outstanding Nothing)
+  assertEqual "the click is remembered as the state the player asked for" (Just request) afterClick
+  assertEqual "the click is shown before any tick processes it" True (armedOf clicked afterClick)
+  assertEqual "the submission's own snapshot leaves the optimistic state alone" True (armedOf clicked afterSubmission)
+  assertEqual "a tick that refuses the order reverts the panel to the snapshot" False (armedOf refused afterRefusedTick)
+  assertEqual "the refused request is dropped rather than displayed" Nothing afterRefusedTick
+  assertEqual
+    "the panel stops offering to arm while the refused order's reload runs"
+    False
+    (gunPanelToggleEnabled (gunPanelState refused afterRefusedTick Nothing))
+  assertEqual "a tick that applies the order shows the snapshot's armed state" True (armedOf applied afterAppliedTick)
+  assertEqual "the applied request is dropped once the snapshot agrees" Nothing afterAppliedTick
+
+-- | The lock control acts on the hovered ship, or on the locked one, and never
+-- offers a lock action with no target — least of all on the player's own hull.
+testGunPanelLockControlNeedsALockableTarget :: IO ()
+testGunPanelLockControlNeedsALockableTarget = do
+  let
+    unlockedSnapshot = combatSnapshotFromState caravelaDuelScenario caravelaDuel
+    lockedSnapshot = panelSnapshotWith (withPlayerShip (\ship -> ship {shipLockedTarget = Just EnemyShip}))
+    selfLockedSnapshot = panelSnapshotWith (withPlayerShip (\ship -> ship {shipLockedTarget = Just PlayerShip}))
+    stateOf snapshot hovered = gunPanelState snapshot Nothing hovered
+  assertEqual
+    "no hover and no lock leaves the panel without a lock action"
+    Nothing
+    (gunPanelLockTarget (stateOf unlockedSnapshot Nothing))
+  assertEqual
+    "a hovered ship is the lock control's target"
+    (Just EnemyShip)
+    (gunPanelLockTarget (stateOf unlockedSnapshot (Just EnemyShip)))
+  assertEqual
+    "hovering a ship that is not locked offers a lock"
+    False
+    (gunPanelLockReleases (stateOf unlockedSnapshot (Just EnemyShip)))
+  assertEqual
+    "an already locked ship is the lock control's target"
+    (Just EnemyShip)
+    (gunPanelLockTarget (stateOf lockedSnapshot Nothing))
+  assertEqual
+    "the locked ship's control releases the lock"
+    True
+    (gunPanelLockReleases (stateOf lockedSnapshot Nothing))
+  assertEqual
+    "the player's own hull is never a lock control target"
+    Nothing
+    (gunPanelLockTarget (stateOf unlockedSnapshot (Just PlayerShip)))
+  assertEqual
+    "a hand-built self-lock is never a lock control target"
+    Nothing
+    (gunPanelLockTarget (stateOf selfLockedSnapshot Nothing))
+
+-- | The reticle radius the shipped canvas and camera give the pointer, in battle
+-- units. Every reticle test starts from this one number.
+expectedReticleRadius :: Double
+expectedReticleRadius = screenReticleRadius battleCamera battleCanvasSize
+
+-- | A pointer in the shipped canvas's own pixels, converted the way the client
+-- converts one.
+canvasPointer :: ScreenPoint -> PointerSample
+canvasPointer point = pointerSample battleCamera point battleCanvasSize
+
+-- | The gesture a press with an already-selected speed produces, for scenes that
+-- need one without walking a whole pointer sequence.
+selectedSpeedGesture :: Point -> Double -> Maybe Double -> NavigationGesture
+selectedSpeedGesture waypoint maximumSpeed selectedSpeed =
+  NavigationGesture (NavigationPress waypoint waypoint maximumSpeed Nothing) selectedSpeed
+
+-- | Whether a release asked for a navigation order at all.
+releaseNavigates :: Maybe NavigationReleaseIntent -> Bool
+releaseNavigates intent =
+  case intent of
+    Just NavigateOnRelease {} -> True
+    _ -> False
+
+-- | The names of the reticle rings a scene carries.
+reticleRingNames :: RenderScene -> [Text]
+reticleRingNames scene =
+  [ name
+  | RingStroke name _ _ _ _ _ <- renderSceneNodes scene
+  , "reticle" `Text.isInfixOf` name
+  ]
+
+-- | A snapshot of the duel's own state with the player's ship changed.
+panelSnapshotWith :: (CombatState -> CombatState) -> CombatSnapshot
+panelSnapshotWith change = combatSnapshotFromState caravelaDuelScenario (change caravelaDuel)
+
+withPlayerShip :: (Ship -> Ship) -> CombatState -> CombatState
+withPlayerShip change state = state {combatPlayer = change (combatPlayer state)}
+
+-- | The panel's state for a player ship with the given guns.
+panelStateWith :: (Ship -> Ship) -> GunPanelState
+panelStateWith change = gunPanelState (panelSnapshotWith (withPlayerShip change)) Nothing Nothing
+
+-- | A snapshot on a chosen tick with the player's guns in a chosen state, for
+-- walking the optimistic toggle across a tick boundary.
+panelSnapshotAt :: Int -> Bool -> Int -> CombatSnapshot
+panelSnapshotAt tick permitted remaining =
+  panelSnapshotWith
+    ( \state ->
+        (withPlayerShip (\ship -> ship {shipFirePermission = permitted, shipReload = remaining}) state)
+          {combatTick = tick}
+    )
+
+expectRingStrokeStyle :: Text -> RenderScene -> IO (Transform, Scalar, StrokeStyle)
+expectRingStrokeStyle name scene =
+  case matchingNodes of
+    [(localTransform, radius, style)] -> pure (localTransform, radius, style)
+    [] -> die $ "missing ring stroke " <> show name
+    nodes -> die $ "expected one ring stroke " <> show name <> ", got " <> show (length nodes)
+ where
+  matchingNodes =
+    [ (localTransform, radius, style)
+    | RingStroke nodeName localTransform _ radius _ style <- renderSceneNodes scene
+    , nodeName == name
+    ]
 
 testHoverNavigationRenderScene :: IO ()
 testHoverNavigationRenderScene = do
@@ -2756,7 +3169,7 @@ testSetupOverlayBlocksNavigation = do
       combatSnapshotFromState
         caravelaDuelScenario
         (tickCombat [IssueNavigationOrder PlayerShip (Point 40 20)] caravelaDuel)
-    gesture = NavigationGesture (Point 40 20) 4 (Just 2)
+    gesture = selectedSpeedGesture (Point 40 20) 4 (Just 2)
     setupScene = battleRenderScene (battleSceneFromSnapshotWithNavigationGesture True (Just (Point 30 20)) gesture snapshot)
   assertEqual "setup overlay rejects navigation input" False (navigationInputAllowed True ScenarioRunning)
   assertEqual "setup overlay hides active, hover, and drag planning overlays" [] (filter isPlanningNode (renderSceneNodes setupScene))
@@ -2769,7 +3182,7 @@ testFinishedScenarioBlocksNavigation = do
         { combatStatus = ScenarioFinished (Winner PlayerShip)
         }
     finishedSnapshot = combatSnapshotFromState caravelaDuelScenario finishedState
-    gesture = NavigationGesture (Point 40 20) 4 (Just 2)
+    gesture = selectedSpeedGesture (Point 40 20) 4 (Just 2)
     finishedScene = battleRenderScene (battleSceneFromSnapshotWithNavigationGesture False (Just (Point 30 20)) gesture finishedSnapshot)
   assertEqual "finished scenario rejects navigation input" False (navigationInputAllowed False (combatSnapshotStatus finishedSnapshot))
   assertEqual "finished scenario rejects navigation planning" Nothing (planNavigationForSnapshot finishedSnapshot PlayerShip (Point 30 20))

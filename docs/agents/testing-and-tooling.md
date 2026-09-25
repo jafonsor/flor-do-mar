@@ -147,6 +147,13 @@ Two traps, plus two sandbox notes:
   the app's own state text, which the client renders as
   `Tick N | <scenario> | Player | Hull … | Enemy | Hull … | Gunnery | …`.
   That text is the cheapest ground truth for "did the simulation actually progress".
+  Two rules keep that parse landing on the right segment: the ship panels keep the
+  words `Player` and `Enemy` and their order, and nothing rendered *before* them
+  may contain either word — the gun panel over the battle canvas is the one that
+  comes close, so its controls are labelled `Fire at will` and `Lock`/`Unlock`,
+  and the per-ship gunnery numbers stay in the status grid. The split is
+  `text.split('Player')[1]`, so a stray `Player` in the panel would hand the
+  harness the wrong segment and every number read from it.
   When the *pixels* are what is in question, `cdp-canvas-picture.mjs` captures them
   reliably by asking the canvas from a microtask queued inside the frame's own task
   — see *A half-drawn canvas is not a missing scene* above.
