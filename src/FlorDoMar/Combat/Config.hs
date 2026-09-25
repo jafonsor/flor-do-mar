@@ -139,7 +139,12 @@ configuredEngagement config playerBoatKind enemyBoatKind = do
     , combatWind = Wind {windDirection = Heading 0, windSpeed = 0}
     , combatPlayer = shipFromConfig PlayerShip (Point 0 0) (Heading 0) playerBoat
     , combatEnemy = shipFromConfig EnemyShip (Point 0 80) (Heading 180) enemyBoat
-    , combatEnemyOrbitAutopilot = EnemyOrbitAutopilot (Point 0 80) 0
+    -- The orbit centre is the arena centre, not the enemy's starting position,
+    -- so the whole ring sits in view instead of straddling the top edge of the
+    -- canvas. The enemy starts 40 units north of it — out of the guns' reach, so
+    -- the fight opens with a closing phase — and closes onto the ring. The
+    -- camera is already centred on this point.
+    , combatEnemyOrbitAutopilot = EnemyOrbitAutopilot (Point 0 40) 0
     , combatStatus = ScenarioRunning
     }
 
@@ -304,7 +309,11 @@ validateBoat path fields =
   (broadsideRangeValue, broadsideRangeDiagnostics) = requiredPositiveNumber path "broadside_range" fields
   (broadsideDamageValue, broadsideDamageDiagnostics) = requiredPositiveInt path "broadside_damage" fields
   (reloadTicksValue, reloadTicksDiagnostics) = requiredNonNegativeInt path "reload_ticks" fields
-  (firingArcDegrees, firingArcDiagnostics) = requiredNumberWhere path "firing_arc_degrees" fields (\value -> value > 0 && value <= 180) "Must be greater than zero and no more than 180 degrees." "Use a firing arc in the range (0, 180]."
+  -- A half-angle of 90 degrees is the widest that keeps a ship's two broadsides
+  -- disjoint: any wider and they overlap into one all-round battery, and a
+  -- volley would no longer have exactly one candidate side. The shipped 45 is
+  -- unaffected.
+  (firingArcDegrees, firingArcDiagnostics) = requiredNumberWhere path "firing_arc_degrees" fields (\value -> value > 0 && value <= 90) "Must be greater than zero and no more than 90 degrees." "Use a firing arc in the range (0, 90]."
   values = (boatId, displayName, maxHull, renderedLength, renderedWidth, battleSpeed, maxSpeed, acceleration, deceleration, turnRate, idealTurnSpeed, yawAcceleration, broadsideRangeValue, broadsideDamageValue, reloadTicksValue, firingArcDegrees)
   diagnostics = concat [idDiagnostics, displayNameDiagnostics, maxHullDiagnostics, renderedLengthDiagnostics, renderedWidthDiagnostics, battleSpeedDiagnostics, maxSpeedDiagnostics, accelerationDiagnostics, decelerationDiagnostics, turnRateDiagnostics, idealTurnSpeedDiagnostics, yawAccelerationDiagnostics, broadsideRangeDiagnostics, broadsideDamageDiagnostics, reloadTicksDiagnostics, firingArcDiagnostics]
   boatIdMismatch =

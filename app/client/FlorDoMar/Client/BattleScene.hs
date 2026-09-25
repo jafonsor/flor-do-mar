@@ -90,10 +90,19 @@ battleRenderScene scene =
           <> navigationGestureNodes scene
     }
 
+-- | The battle view's fixed camera.
+--
+-- At 0.6 the visible world is 266.7 by 150 units centred on the arena centre, so
+-- the opening engagement — both hulls, both engagement-facing firing envelopes
+-- and the contested space between them — fits at once, and the big boat still
+-- renders about 46 by 17 pixels on the 760 by 428 canvas. 'screenToBattlePoint'
+-- and the renderer both divide by the zoom, so pointer conversion and
+-- hit-testing follow it rather than assuming 1.
 battleCamera :: Camera2D
 battleCamera =
   (camera2D (viewport 160 90))
     { cameraCenter = vec2 0 40
+    , cameraZoom = 0.6
     }
 
 shipMarker :: ShipSnapshot -> ShipMarker

@@ -1,7 +1,9 @@
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Main (main) where
 
+import Control.Monad (forM_)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import FlorDoMar.Client.BattleInput
@@ -47,10 +49,13 @@ main = do
   testRejectsMalformedRuntimeCombatConfig
   testRejectsInvalidRuntimeCombatConfig
   testRejectsBoatIdAssetMismatch
+  testRejectsFiringArcWiderThanNinetyDegrees
+  testAcceptsAFiringArcAtTheNinetyDegreeLimit
   testRejectsMissingRuntimeCombatConfig
   testLocalApiStartsCaravelaDuel
   testConfiguredLocalApiStartsBigVsSmall
   testConfiguredEngagementStartsWithNoFiringState
+  testShippedDuelOpensOutsideBothShipsReach
   testHotReloadKeepsLockAndFirePermission
   testConfiguredMovementPhysics
   testNavigationPlannerClampsAndCommitsOrders
@@ -81,6 +86,9 @@ main = do
   testLocalApiFiresAndWithdrawsThroughTheQueuedOrders
   testLocalApiReportsTerminalState
   testInitialBattleRenderScene
+  testShippedEngagementFitsTheVisibleExtent
+  testShippedEnemyOrbitRingStaysInsideTheVisibleExtent
+  testShippedZoomRendersHullsLegibly
   testDamagedBattleRenderSceneTint
   testActiveNavigationRenderScene
   testEnemyDebugNavigationRenderScene
@@ -626,6 +634,13 @@ testLoadsRuntimeCombatConfig = do
   assertEqual "configured small display name" "Small boat" (boatConfigDisplayName small)
   assertApprox "configured big length" 16 (boatConfigRenderedLength big)
   assertApprox "configured small length" 9 (boatConfigRenderedLength small)
+  -- The shipped gunnery numbers are what the game plays with: three big-boat
+  -- lengths of practical range, and a half-angle narrow enough that the two
+  -- broadsides stay disjoint.
+  assertApprox "configured big broadside range" 48 (boatConfigBroadsideRange big)
+  assertApprox "configured small broadside range" 48 (boatConfigBroadsideRange small)
+  assertApprox "configured big firing arc" 45 (boatConfigFiringArcDegrees big)
+  assertApprox "configured small firing arc" 45 (boatConfigFiringArcDegrees small)
 
 testRejectsMalformedRuntimeCombatConfig :: IO ()
 testRejectsMalformedRuntimeCombatConfig = do
@@ -643,6 +658,25 @@ testRejectsBoatIdAssetMismatch :: IO ()
 testRejectsBoatIdAssetMismatch = do
   diagnostics <- expectLeft "reject boat id mismatch" =<< loadCombatConfig "test/fixtures/config-id-mismatch"
   assertDiagnostic "boat id mismatch reports id" "id" diagnostics
+
+-- | The half-angle bound is what keeps a ship's two broadsides disjoint, so a
+-- config that widens it into an all-round battery is refused by name.
+testRejectsFiringArcWiderThanNinetyDegrees :: IO ()
+testRejectsFiringArcWiderThanNinetyDegrees = do
+  diagnostics <- expectLeft "reject a firing arc wider than 90 degrees" =<< loadCombatConfig "test/fixtures/config-arc-too-wide"
+  assertDiagnostic "a too-wide firing arc reports the field" "firing_arc_degrees" diagnostics
+  assertSemanticDiagnostic "a too-wide firing arc explains the field problem" "firing_arc_degrees" diagnostics
+
+-- | The bound is inclusive: a 90-degree half-angle is the widest disjoint pair,
+-- so it validates. The shipped 45 is asserted against the shipped assets by
+-- 'testLoadsRuntimeCombatConfig'.
+testAcceptsAFiringArcAtTheNinetyDegreeLimit :: IO ()
+testAcceptsAFiringArcAtTheNinetyDegreeLimit = do
+  config <- expectRight "accept a firing arc of exactly 90 degrees" =<< loadCombatConfig "test/fixtures/config-arc-at-limit"
+  big <- expectBoatConfig "arc-limit big boat" "big" config
+  small <- expectBoatConfig "arc-limit small boat" "small" config
+  assertApprox "a firing arc at the validation limit is accepted" 90 (boatConfigFiringArcDegrees big)
+  assertApprox "the narrow arc beside it is untouched" 45 (boatConfigFiringArcDegrees small)
 
 testRejectsMissingRuntimeCombatConfig :: IO ()
 testRejectsMissingRuntimeCombatConfig = do
@@ -1043,7 +1077,10 @@ testEnemyOrbitAutopilotIssuesNavigationOrders :: IO ()
 testEnemyOrbitAutopilotIssuesNavigationOrders = do
   let
     initialState = caravelaDuel
-    initialCenter = shipPosition (combatEnemy initialState)
+    -- The enemy still starts at (0, 80); its orbit centre is the arena centre,
+    -- which is the point the camera is centred on, so the ring sits in view.
+    arenaCenter = Point 0 40
+    startingPosition = shipPosition (combatEnemy initialState)
     firstOrdered = tickCombat [] initialState
     firstEnemy = combatEnemy firstOrdered
     firstAutopilot = combatEnemyOrbitAutopilot firstOrdered
@@ -1062,11 +1099,12 @@ testEnemyOrbitAutopilotIssuesNavigationOrders = do
     afterArrival = tickCombat [] reachedFirstWaypoint
     nextAutopilot = combatEnemyOrbitAutopilot afterArrival
   nextOrder <- expectNavigationOrder "enemy autopilot issues the next order after arrival" (combatEnemy afterArrival)
-  assertPoint "first orbit center is the enemy starting position" initialCenter (enemyOrbitCenter firstAutopilot)
-  assertApprox "first orbit waypoint uses the fixed radius" enemyOrbitRadius (pointDistance initialCenter (navigationRequestedWaypoint firstOrder))
+  assertPoint "the enemy starts north of the arena" (Point 0 80) startingPosition
+  assertPoint "first orbit center is the arena centre" arenaCenter (enemyOrbitCenter firstAutopilot)
+  assertApprox "first orbit waypoint uses the fixed radius" enemyOrbitRadius (pointDistance arenaCenter (navigationRequestedWaypoint firstOrder))
   assertEqual "first orbit order is an ordinary navigation order" (navigationRequestedWaypoint firstOrder) (navigationReachableWaypoint firstOrder)
   assertEqual "orbit advances after issuing a successive waypoint" 2 (enemyOrbitNextWaypointIndex nextAutopilot)
-  assertApprox "next orbit waypoint keeps the fixed radius" enemyOrbitRadius (pointDistance initialCenter (navigationRequestedWaypoint nextOrder))
+  assertApprox "next orbit waypoint keeps the fixed radius" enemyOrbitRadius (pointDistance arenaCenter (navigationRequestedWaypoint nextOrder))
 
 navigationMovement :: MovementPhysics
 navigationMovement =
@@ -1203,6 +1241,22 @@ tunedBoatConfig config =
       "small" -> boat {boatConfigBroadsideRange = 100, boatConfigBroadsideDamage = 13, boatConfigReloadTicks = 1, boatConfigFiringArcDegrees = 45}
       _ -> boat
 
+-- | Give every boat the reach a volley across the duel's opening needs.
+--
+-- The shipped practical range is 48, short of the 80-unit opening separation, so
+-- the shipped duel opens with a closing phase. Tests whose subject is a tuning
+-- path rather than the shipped geometry use this to reach across the opening;
+-- the shipped numbers themselves are pinned by 'testLoadsRuntimeCombatConfig'
+-- and 'testShippedDuelOpensOutsideBothShipsReach'.
+configReachingAcrossTheOpening :: CombatConfig -> CombatConfig
+configReachingAcrossTheOpening config =
+  config
+    { combatConfigBoats =
+        [ boat {boatConfigBroadsideRange = 90}
+        | boat <- combatConfigBoats config
+        ]
+    }
+
 -- | A ship built from a boat config is armed the way every other ship starts:
 -- no locked target and no permission to fire.
 testConfiguredEngagementStartsWithNoFiringState :: IO ()
@@ -1213,6 +1267,24 @@ testConfiguredEngagementStartsWithNoFiringState = do
   assertEqual "configured player starts with its guns not permitted to fire" False (shipFirePermission (combatPlayer engagement))
   assertEqual "configured enemy starts with no locked target" Nothing (shipLockedTarget (combatEnemy engagement))
   assertEqual "configured enemy starts with its guns not permitted to fire" False (shipFirePermission (combatEnemy engagement))
+
+-- | The reduced practical range is a pacing decision: at the shipped 48 the
+-- duel's 80-unit opening separation is outside both ships' reach, so the fight
+-- opens with a closing phase. That is intended and is pinned here rather than
+-- assumed, for both boats and every side.
+testShippedDuelOpensOutsideBothShipsReach :: IO ()
+testShippedDuelOpensOutsideBothShipsReach = do
+  config <- expectRight "load packaged config for the opening separation" =<< loadRuntimeCombatConfig
+  let
+    engagement = configuredDefaultEngagement config
+    separation = pointDistance (shipPosition (combatPlayer engagement)) (shipPosition (combatEnemy engagement))
+  assertApprox "the shipped duel opens at its designed separation" 80 separation
+  forM_ [(PlayerShip, EnemyShip), (EnemyShip, PlayerShip)] $ \(attackerId, targetId) ->
+    forM_ [Port, Starboard] $ \side ->
+      case canFireBroadsideWith (broadsideTuningForShip config) engagement attackerId targetId side of
+        TargetOutOfRange reportedRange ->
+          assertApprox "the opened distance is what each side reports as out of reach" separation reportedRange
+        other -> die $ "expected the shipped opening separation to hold no broadside, got " <> show other
 
 -- | A hot reload refreshes what the boat kind owns. The lock and the permission
 -- belong to the live ship, so neither may be reset by it.
@@ -1270,17 +1342,22 @@ testConfiguredMovementSnapshot = do
 -- | Configured gunnery tuning is what a volley through the API actually uses:
 -- the tuned damage lands on the enemy and the tuned reload appears in the
 -- player's snapshot.
+--
+-- The fixture supplies the reach as well as the damage and reload: the shipped
+-- 48 no longer covers the duel's opening separation, and that the shipped
+-- opening is out of range is pinned by 'testShippedDuelOpensOutsideBothShipsReach'.
 testConfiguredLocalApiBroadsideTuning :: IO ()
 testConfiguredLocalApiBroadsideTuning = do
   config <- expectRight "load packaged config for API broadside tuning" =<< loadRuntimeCombatConfig
   let
     tunedConfig =
-      config
-        { combatConfigBoats =
-            [ boat {boatConfigBroadsideDamage = 31, boatConfigReloadTicks = 4}
-            | boat <- combatConfigBoats config
-            ]
-        }
+      configReachingAcrossTheOpening $
+        config
+          { combatConfigBoats =
+              [ boat {boatConfigBroadsideDamage = 31, boatConfigReloadTicks = 4}
+              | boat <- combatConfigBoats config
+              ]
+          }
   localApi <- newConfiguredLocalCombatApi tunedConfig
   let api = localCombatApi localApi
   _ <- expectRight "start configured scenario for API broadside tuning" =<< combatApiStartScenario api caravelaDuelScenarioId
@@ -1296,10 +1373,15 @@ testConfiguredLocalApiBroadsideTuning = do
 -- The opening volley is deliberate: it makes the reload across the reload
 -- non-zero, and the tuning the reloaded config supplies is then proven by the
 -- volley that follows rather than by the config object alone.
+--
+-- The opening volley needs reach across the duel's opening separation, which the
+-- shipped 48 no longer supplies, so the pre-reload engagement is given it here;
+-- this test is about the tuning path across a hot reload rather than about the
+-- closing phase, which 'testShippedDuelOpensOutsideBothShipsReach' pins.
 testConfiguredLocalApiHotReloadsLiveEngagement :: IO ()
 testConfiguredLocalApiHotReloadsLiveEngagement = do
   config <- expectRight "load packaged config for hot reload" =<< loadRuntimeCombatConfig
-  localApi <- newConfiguredLocalCombatApi config
+  localApi <- newConfiguredLocalCombatApi (configReachingAcrossTheOpening config)
   let api = localCombatApi localApi
   _ <- expectRight "start configured scenario before hot reload" =<< combatApiStartScenario api caravelaDuelScenarioId
   _ <- queueLocalCommand "queue player heading before hot reload" api (SetHeading PlayerShip (Heading 90))
@@ -1659,7 +1741,7 @@ testInitialBattleRenderScene = do
   assertVec2 "render camera center" (vec2 0 40) (cameraCenter camera)
   assertApproxScalar "render camera viewport width" 160 (viewportWidth (cameraViewport camera))
   assertApproxScalar "render camera viewport height" 90 (viewportHeight (cameraViewport camera))
-  assertApproxScalar "render camera zoom" 1 (cameraZoom camera)
+  assertApproxScalar "render camera zoom" 0.6 (cameraZoom camera)
   assertEqual "render mesh count" 6 (length meshes)
   assertEqual "ship nodes flatten to render primitives" 6 (length primitives)
   assertMesh
@@ -1710,6 +1792,118 @@ testInitialBattleRenderScene = do
     (vec3 1 1 0.25)
     (color 0.56 0.93 0.7 1)
     =<< expectMesh "target-heading:enemy" renderScene
+
+-- | The range decision and the zoom decision are one decision: at 0.6 the
+-- visible world is 266.7 by 150 units centred on the arena centre, and the
+-- engagement-facing half of the duel's opening geometry fits inside it — both
+-- hulls, each ship's engagement-facing envelope, and the contested space between
+-- them.
+--
+-- Known clarification, recorded in issue 03: the criterion asks for the whole of
+-- both ships' reach, and the outward-facing wedges do not fit. At this zoom the
+-- visible world runs from -35 to 115 vertically, while the player's outward
+-- envelope reaches y = -48 and the enemy's outward envelope y = 128 — each 13
+-- units past the canvas edge. The last two assertions pin that, so a future
+-- camera or range change cannot move it unnoticed.
+testShippedEngagementFitsTheVisibleExtent :: IO ()
+testShippedEngagementFitsTheVisibleExtent = do
+  config <- expectRight "load packaged config for the visible extent" =<< loadRuntimeCombatConfig
+  let
+    engagement = configuredDefaultEngagement config
+    player = combatPlayer engagement
+    enemy = combatEnemy engagement
+    playerTuning = broadsideTuningForShip config player
+    enemyTuning = broadsideTuningForShip config enemy
+    extent = visibleBounds battleCamera
+    playerFacing = broadsideBounds player playerTuning (sideFacing player enemy)
+    enemyFacing = broadsideBounds enemy enemyTuning (sideFacing enemy player)
+    contested = intersectBounds playerFacing enemyFacing
+    playerOutward = broadsideBounds player playerTuning (oppositeSide (sideFacing player enemy))
+    enemyOutward = broadsideBounds enemy enemyTuning (oppositeSide (sideFacing enemy player))
+  assertApprox "the visible world reaches the west edge" (-133.33333) (boundsMinX extent)
+  assertApprox "the visible world reaches the east edge" 133.33333 (boundsMaxX extent)
+  assertApprox "the visible world reaches the south edge" (-35) (boundsMinY extent)
+  assertApprox "the visible world reaches the north edge" 115 (boundsMaxY extent)
+  assertInsideExtent "the player's hull" (hullBounds player) extent
+  assertInsideExtent "the enemy's hull" (hullBounds enemy) extent
+  assertInsideExtent "the player's engagement-facing envelope" playerFacing extent
+  assertInsideExtent "the enemy's engagement-facing envelope" enemyFacing extent
+  assertInsideExtent "the contested space" contested extent
+  assertEqual "the player's engagement-facing side is its port" Port (sideFacing player enemy)
+  assertEqual "the enemy's engagement-facing side is its port" Port (sideFacing enemy player)
+  assertEqual "the contested space is the overlap of both reaches" True (boundsWidth contested > 0 && boundsHeight contested > 0)
+  -- The player's envelope runs 48 units north from its hull and the enemy's 48
+  -- south from its own, so they meet between y = 32 and y = 48, and neither is
+  -- wider than the half-angle allows: 48 cos 45 = 33.94 off the centre line.
+  assertApprox "the contested space opens where the enemy's reach ends" 32 (boundsMinY contested)
+  assertApprox "the contested space closes at the player's reach" 48 (boundsMaxY contested)
+  assertApprox "the widest the reaches get is 48 cos 45 off the centre line" 33.9411 (boundsMaxX contested)
+  assertApprox "the contested space mirrors about the centre line" (-33.9411) (boundsMinX contested)
+  -- Known clarification: the outward-facing wedges are the part that does not fit.
+  assertApprox "the player's outward envelope reaches 13 units past the south edge" (boundsMinY extent - 13) (boundsMinY playerOutward)
+  assertApprox "the enemy's outward envelope reaches 13 units past the north edge" (boundsMaxY extent + 13) (boundsMaxY enemyOutward)
+
+-- | The enemy's orbit is a circle of the fixed radius about the arena centre, so
+-- the furthest any part of the enemy reaches from that centre is the radius plus
+-- half its drawn length. That reach has to sit inside the visible world for a
+-- whole circuit: the check is sufficient and exact because the ring is a circle
+-- and the hull is drawn centred on it.
+testShippedEnemyOrbitRingStaysInsideTheVisibleExtent :: IO ()
+testShippedEnemyOrbitRingStaysInsideTheVisibleExtent = do
+  config <- expectRight "load packaged config for the orbit ring" =<< loadRuntimeCombatConfig
+  let
+    engagement = configuredDefaultEngagement config
+    enemy = combatEnemy engagement
+    center = enemyOrbitCenter (combatEnemyOrbitAutopilot engagement)
+    ringReach = enemyOrbitRadius + shipRenderedLength enemy / 2
+    ring =
+      Bounds
+        { boundsMinX = pointX center - ringReach
+        , boundsMaxX = pointX center + ringReach
+        , boundsMinY = pointY center - ringReach
+        , boundsMaxY = pointY center + ringReach
+        }
+  assertPoint "the shipped orbit centre is the arena centre" (Point 0 40) center
+  assertApprox "the camera is centred on the orbit centre's x" (pointX center) (realToFrac (vec2X (cameraCenter battleCamera)))
+  assertApprox "the camera is centred on the orbit centre's y" (pointY center) (realToFrac (vec2Y (cameraCenter battleCamera)))
+  assertApprox "the ring plus half the enemy's hull reaches 28.5 units" 28.5 ringReach
+  assertInsideExtent "the enemy's whole orbit circuit" ring (visibleBounds battleCamera)
+
+-- | Legibility is checked numerically rather than in a browser: the battle
+-- canvas's drawing buffer is 760 by 428 and the camera's world viewport is 160
+-- by 90, so at zoom 0.6 one world unit is 2.85 pixels and the shipped hulls
+-- render 45.6 by 17.1 pixels (big boat) and 25.65 by 8.55 (small boat). The
+-- smallest dimension rounds to nine pixels, which is what makes the hulls
+-- readable while the whole engagement fits.
+--
+-- The check by eye is deliberately deferred to issue 07: it is the first issue
+-- with a firing envelope to look at, and driving a browser for it needs an
+-- escalation this session does not have.
+testShippedZoomRendersHullsLegibly :: IO ()
+testShippedZoomRendersHullsLegibly = do
+  config <- expectRight "load packaged config for the zoom legibility" =<< loadRuntimeCombatConfig
+  let
+    engagement = configuredDefaultEngagement config
+    view = cameraViewport battleCamera
+    zoom = realToFrac (cameraZoom battleCamera) :: Double
+    worldWidth = realToFrac (viewportWidth view) / zoom
+    worldHeight = realToFrac (viewportHeight view) / zoom
+    pixelsPerUnitX = battleCanvasWidthPixels / worldWidth
+    pixelsPerUnitY = battleCanvasHeightPixels / worldHeight
+    pixels ship = (shipRenderedLength ship * pixelsPerUnitX, shipRenderedWidth ship * pixelsPerUnitX)
+    (bigLengthPixels, bigWidthPixels) = pixels (combatPlayer engagement)
+    (smallLengthPixels, smallWidthPixels) = pixels (combatEnemy engagement)
+  assertApprox "the zoomed world viewport is 266.7 units wide" 266.66666 worldWidth
+  assertApprox "the zoomed world viewport is 150 units tall" 150 worldHeight
+  assertApprox "one world unit is 2.85 pixels across at the shipped zoom" 2.85 pixelsPerUnitX
+  -- The canvas is 760 by 428 rather than exactly 16:9, so the vertical scale is
+  -- a tenth of a percent larger; the pixel sizes below use the horizontal one.
+  assertApprox "the canvas is not exactly 16:9, so the vertical scale is 2.8533" 2.85333 pixelsPerUnitY
+  assertApprox "the big boat renders 45.6 pixels long" 45.6 bigLengthPixels
+  assertApprox "the big boat renders 17.1 pixels abeam" 17.1 bigWidthPixels
+  assertApprox "the small boat renders 25.65 pixels long" 25.65 smallLengthPixels
+  assertApprox "the small boat renders 8.55 pixels abeam" 8.55 smallWidthPixels
+  assertEqual "the smallest hull still clears 25 pixels by 8" True (smallLengthPixels >= 25 && smallWidthPixels >= 8)
 
 testDamagedBattleRenderSceneTint :: IO ()
 testDamagedBattleRenderSceneTint = do
@@ -2089,6 +2283,161 @@ offsetPoint point offsetX offsetY =
 pointDistance :: Point -> Point -> Double
 pointDistance from to =
   sqrt (((pointX to - pointX from) ** 2) + ((pointY to - pointY from) ** 2))
+
+-- | The drawing buffer the client serves the battle canvas at.
+battleCanvasWidthPixels :: Double
+battleCanvasWidthPixels = 760
+
+battleCanvasHeightPixels :: Double
+battleCanvasHeightPixels = 428
+
+-- | An axis-aligned box in world units: the visible world, a hull, or a firing
+-- envelope's bounds.
+data Bounds = Bounds
+  { boundsMinX :: Double
+  , boundsMaxX :: Double
+  , boundsMinY :: Double
+  , boundsMaxY :: Double
+  }
+  deriving stock (Eq, Show)
+
+-- | The world rectangle a camera shows: half the world viewport on each side of
+-- its centre. This is the same division 'camera2DMatrix' and
+-- 'screenToBattlePoint' do, so the extent asserted here is the one drawn.
+visibleBounds :: Camera2D -> Bounds
+visibleBounds camera =
+  Bounds
+    { boundsMinX = centerX - halfWidth
+    , boundsMaxX = centerX + halfWidth
+    , boundsMinY = centerY - halfHeight
+    , boundsMaxY = centerY + halfHeight
+    }
+ where
+  centerX = realToFrac (vec2X (cameraCenter camera))
+  centerY = realToFrac (vec2Y (cameraCenter camera))
+  zoom = realToFrac (cameraZoom camera) :: Double
+  halfWidth = realToFrac (viewportWidth (cameraViewport camera)) / (2 * zoom)
+  halfHeight = realToFrac (viewportHeight (cameraViewport camera)) / (2 * zoom)
+
+-- | The box a hull occupies at its heading.
+hullBounds :: Ship -> Bounds
+hullBounds ship =
+  Bounds
+    { boundsMinX = positionX - extentX
+    , boundsMaxX = positionX + extentX
+    , boundsMinY = positionY - extentY
+    , boundsMaxY = positionY + extentY
+    }
+ where
+  positionX = pointX (shipPosition ship)
+  positionY = pointY (shipPosition ship)
+  halfLength = shipRenderedLength ship / 2
+  halfWidth = shipRenderedWidth ship / 2
+  radians = toRadians (headingDegrees (shipHeading ship))
+  extentX = abs (halfLength * cos radians) + abs (halfWidth * sin radians)
+  extentY = abs (halfLength * sin radians) + abs (halfWidth * cos radians)
+
+-- | The box one broadside's firing envelope occupies: a circular sector from the
+-- ship along that side's beam, out to the boat's practical range. A sector's
+-- extremes are its apex or its arc at one of the two half-angle edges or at an
+-- axis direction inside it, so those candidates are exact rather than sampled.
+broadsideBounds :: Ship -> BroadsideTuning -> BroadsideSide -> Bounds
+broadsideBounds ship tuning side =
+  Bounds
+    { boundsMinX = minimum (fmap fst corners)
+    , boundsMaxX = maximum (fmap fst corners)
+    , boundsMinY = minimum (fmap snd corners)
+    , boundsMaxY = maximum (fmap snd corners)
+    }
+ where
+  corners = (pointX center, pointY center) : fmap (sectorPoint center range) directions
+  center = shipPosition ship
+  range = broadsideTuningRange tuning
+  halfAngle = broadsideTuningFiringArcDegrees tuning
+  beam = headingDegrees (shipHeading ship) + beamOffset side
+  directions = [beam - halfAngle, beam + halfAngle] <> filter insideArc [0, 90, 180, 270]
+  insideArc degrees = abs (signedAngleDelta beam degrees) <= halfAngle + 1e-9
+
+-- | A point on a sector's arc at a given bearing and radius.
+sectorPoint :: Point -> Double -> Double -> (Double, Double)
+sectorPoint center radius degrees =
+  ( pointX center + radius * cos radians
+  , pointY center + radius * sin radians
+  )
+ where
+  radians = toRadians degrees
+
+-- | The beam a broadside fires along, measured from the hull's heading: the port
+-- beam is 90 degrees clockwise of it, the starboard beam 90 degrees the other
+-- way, exactly as the domain's broadside check measures it.
+beamOffset :: BroadsideSide -> Double
+beamOffset side =
+  case side of
+    Port -> 90
+    Starboard -> -90
+
+-- | The broadside whose beam points at the target: the side a ship could bring
+-- to bear if the target were in reach. At the duel's opening geometry both
+-- ships' facing side is their port.
+sideFacing :: Ship -> Ship -> BroadsideSide
+sideFacing ship target =
+  if facingDelta Port <= facingDelta Starboard then Port else Starboard
+ where
+  facingDelta side = abs (signedAngleDelta (headingDegrees (shipHeading ship) + beamOffset side) bearing)
+  bearing = bearingDegrees (shipPosition ship) (shipPosition target)
+
+oppositeSide :: BroadsideSide -> BroadsideSide
+oppositeSide side =
+  case side of
+    Port -> Starboard
+    Starboard -> Port
+
+-- | The shortest signed angle from one direction to another, in (-180, 180].
+signedAngleDelta :: Double -> Double -> Double
+signedAngleDelta from to =
+  let
+    raw = to - from
+    wrapped = raw - 360 * fromIntegral (floor (raw / 360) :: Int)
+   in
+    if wrapped > 180 then wrapped - 360 else wrapped
+
+bearingDegrees :: Point -> Point -> Double
+bearingDegrees from to =
+  toDegrees (atan2 (pointY to - pointY from) (pointX to - pointX from))
+
+toRadians :: Double -> Double
+toRadians degrees = degrees * pi / 180
+
+toDegrees :: Double -> Double
+toDegrees radians = radians * 180 / pi
+
+intersectBounds :: Bounds -> Bounds -> Bounds
+intersectBounds left right =
+  Bounds
+    { boundsMinX = max (boundsMinX left) (boundsMinX right)
+    , boundsMaxX = min (boundsMaxX left) (boundsMaxX right)
+    , boundsMinY = max (boundsMinY left) (boundsMinY right)
+    , boundsMaxY = min (boundsMaxY left) (boundsMaxY right)
+    }
+
+boundsWidth :: Bounds -> Double
+boundsWidth bounds = boundsMaxX bounds - boundsMinX bounds
+
+boundsHeight :: Bounds -> Double
+boundsHeight bounds = boundsMaxY bounds - boundsMinY bounds
+
+boundsWithin :: Bounds -> Bounds -> Bool
+boundsWithin inner outer =
+  boundsMinX inner >= boundsMinX outer
+    && boundsMaxX inner <= boundsMaxX outer
+    && boundsMinY inner >= boundsMinY outer
+    && boundsMaxY inner <= boundsMaxY outer
+
+assertInsideExtent :: String -> Bounds -> Bounds -> IO ()
+assertInsideExtent label inner outer =
+  if boundsWithin inner outer
+    then pure ()
+    else die $ label <> ": expected " <> show inner <> " inside the visible extent " <> show outer
 
 waypointPosition :: NavigationOrder -> Vec3
 waypointPosition order =

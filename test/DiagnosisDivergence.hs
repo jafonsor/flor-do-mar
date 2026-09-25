@@ -71,7 +71,13 @@ main = do
   check failures "orbit autopilot consumes at least 3 waypoints in 300 ticks" (finalIndex >= 3)
 
   -- --- 4. The enemy must stay in the neighbourhood of its orbit centre.
-  let enemyDrift = distanceBetween (shipPosition (combatEnemy finalState)) (Point 0 80)
+  --
+  -- The centre is read from the autopilot rather than hardcoded: it used to be
+  -- the enemy's starting position, and it is now the arena centre, so the
+  -- measured point has to follow whichever the scenario builds.
+  let
+    finalAutopilot = combatEnemyOrbitAutopilot finalState
+    enemyDrift = distanceBetween (shipPosition (combatEnemy finalState)) (enemyOrbitCenter finalAutopilot)
   printf "  enemy distance from orbit centre: %.2f (orbit radius %.1f)\n" enemyDrift enemyOrbitRadius
   check failures "enemy stays within 3x the orbit radius of its centre" (enemyDrift <= 3 * enemyOrbitRadius)
 

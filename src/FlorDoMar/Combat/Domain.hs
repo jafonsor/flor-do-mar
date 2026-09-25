@@ -222,6 +222,14 @@ data BroadsideCheck
   | TargetNotInScenario ShipId
   deriving stock (Eq, Show)
 
+-- | The pre-configuration tuning used by 'caravelaDuel' and the legacy tick
+-- entry points.
+--
+-- It deliberately keeps the old 100-unit reach: the shipped boat configs carry
+-- the values the game plays with (48 since the firing-envelope work), and
+-- 'newLocalCombatApi' is what uses this path. The client always builds
+-- 'newConfiguredLocalCombatApi', and 'caravelaMovement' already diverges from
+-- the shipped config the same way.
 broadsideRange :: Double
 broadsideRange = 100
 
@@ -246,7 +254,10 @@ caravelaDuel =
           EnemyShip
           Point {pointX = 0, pointY = 80}
           (Heading 180)
-    , combatEnemyOrbitAutopilot = enemyOrbitAutopilotAt (Point {pointX = 0, pointY = 80})
+    -- The orbit centre is the arena centre, not the enemy's starting position,
+    -- so the whole ring sits in view. The enemy still starts at (0, 80), which
+    -- is out of the guns' reach, and closes onto the ring.
+    , combatEnemyOrbitAutopilot = enemyOrbitAutopilotAt (Point {pointX = 0, pointY = 40})
     , combatStatus = ScenarioRunning
     }
 
